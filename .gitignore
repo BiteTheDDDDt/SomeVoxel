@@ -1,3 +1,4 @@
 /build/
 /out/
 .godot/
+__pycache__/

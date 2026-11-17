@@ -1,0 +1,64 @@
+#version 450
+layout(local_size_x = 4, local_size_y = 4, local_size_z = 4) in;
+layout(set = 0, binding = 0, std430) restrict buffer VoxelCells { uint cells[]; };
+layout(push_constant, std430) uniform Parameters {
+    ivec4 bounds_and_phase;
+    vec4 field_and_radius;
+};
+
+bool inside(ivec3 p) {
+    return all(greaterThanEqual(p, ivec3(0))) && all(lessThan(p, bounds_and_phase.xyz));
+}
+
+int index_of(ivec3 p) {
+    return p.x + bounds_and_phase.x * (p.z + bounds_and_phase.z * p.y);
+}
+
+ivec3 offset_of(int i) { return ivec3(i & 1, (i >> 2) & 1, (i >> 1) & 1); }
+int lane_of(ivec3 p) { return p.x + 2 * p.z + 4 * p.y; }
+
+void main() {
+    int phase = bounds_and_phase.w;
+    ivec3 base = ivec3(gl_GlobalInvocationID) * 2 - offset_of(phase);
+    if (any(greaterThanEqual(base, bounds_and_phase.xyz))) return;
+    uint tile[8];
+    uint moved = 0u;
+    for (int i = 0; i < 8; i++) {
+        ivec3 p = base + offset_of(i);
+        tile[i] = inside(p) ? cells[index_of(p)] : 1u;
+    }
+    for (int i = 0; i < 8; i++) {
+        if (tile[i] <= 1u || (moved & (1u << i)) != 0u) continue;
+        ivec3 local = offset_of(i);
+        vec3 direction = field_and_radius.xyz - vec3(base + local) - vec3(0.5);
+        int destination = -1;
+        if (dot(direction, direction) < field_and_radius.w * field_and_radius.w) {
+            float best = 0.2;
+            for (int axis = 0; axis < 3; axis++) {
+                ivec3 q = local;
+                q[axis] = 1 - q[axis];
+                int j = lane_of(q);
+                float gain = (q[axis] > local[axis] ? direction[axis] : -direction[axis]);
+                if (gain > best && tile[j] == 0u) { best = gain; destination = j; }
+            }
+        } else if (local.y == 1) {
+            int below = i - 4;
+            if (tile[below] == 0u) destination = below;
+            else {
+                int first = (phase & 1) == 0 ? 1 : 2;
+                int second = 3 - first;
+                if (tile[i ^ first] == 0u && tile[below ^ first] == 0u) destination = below ^ first;
+                else if (tile[i ^ second] == 0u && tile[below ^ second] == 0u) destination = below ^ second;
+            }
+        }
+        if (destination >= 0) {
+            tile[destination] = tile[i];
+            tile[i] = 0u;
+            moved |= 1u << destination;
+        }
+    }
+    for (int i = 0; i < 8; i++) {
+        ivec3 p = base + offset_of(i);
+        if (inside(p)) cells[index_of(p)] = tile[i];
+    }
+}
