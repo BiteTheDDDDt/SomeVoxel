@@ -131,6 +131,8 @@ private:
     std::vector<uint8_t> bulk_water_rows = std::vector<uint8_t>(nx * ny * nz / block);
     std::vector<Grain> grains;
     std::vector<Grain> gravel;
+    std::unordered_map<int64_t, int> tracked_packed_particles;
+    int64_t next_packed_handle = 1;
     GravelLiquidMove gravel_liquid_scratch;
     std::vector<Grain> rock_fragments;
     std::array<std::vector<int>, Char - Ice + 1> element_positions;
@@ -782,6 +784,14 @@ private:
     void erase_gravel(int id) {
         if (!airborne_earth_ejecta.empty()) airborne_earth_ejecta.erase(gravel[id].position);
         const int last = int(gravel.size()) - 1;
+        for (auto it = tracked_packed_particles.begin(); it != tracked_packed_particles.end();) {
+            if (it->second == id) {
+                it = tracked_packed_particles.erase(it);
+            } else {
+                if (it->second == last) it->second = id;
+                ++it;
+            }
+        }
         if (id != last) {
             gravel[id] = gravel[last];
             each_cube(gravel[id].position, gravel[id].extent, [&](int i) { voxels[i].occupant = id; });
@@ -1288,6 +1298,9 @@ public:
     int64_t element_version(int kind) const { return element_kind(kind) ? element_versions[kind - Ice] : 0; }
 
     bool load_boxes(const int32_t *layout, size_t length);
+    static float packed_particle_mass(int extent);
+    int64_t spawn_packed_particle(Vec3 position, int extent, Vec3 impulse = {});
+    std::optional<PackedParticleState> packed_particle_state(int64_t handle) const;
 
     void step();
 

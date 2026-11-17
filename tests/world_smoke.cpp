@@ -26,4 +26,26 @@ int main() {
         return 1;
     }
     std::cout << "SomeVoxel Core preserved sand and water after settling\n";
+
+    constexpr int extent = 4;
+    const float mass = World::packed_particle_mass(extent);
+    const auto target = world.spawn_packed_particle({1.02f, 1.f, 0.45f}, extent);
+    const auto projectile = world.spawn_packed_particle({0.55f, 1.f, 0.45f}, extent, {mass * 5.f, 0, 0});
+    if (!target || !projectile || world.spawn_packed_particle({0.55f, 1.f, 0.45f}, extent) != 0) {
+        std::cerr << "Packed particle insertion did not respect occupancy\n";
+        return 1;
+    }
+    const auto before_contact = world.packed_particle_state(target);
+    for (int tick = 0; tick < 24; ++tick) world.step();
+    const auto after_contact = world.packed_particle_state(target);
+    if (!before_contact || !after_contact || after_contact->position.x <= before_contact->position.x ||
+            after_contact->velocity.x <= 0 || world.status().sand_mass != initial.sand_mass + 2 * 64) {
+        std::cerr << "Packed particles did not transfer momentum or conserve material\n";
+        return 1;
+    }
+    if (!world.load_boxes(layout, sizeof(layout) / sizeof(layout[0])) || world.packed_particle_state(target)) {
+        std::cerr << "A world reload must invalidate packed particle handles\n";
+        return 1;
+    }
+    std::cout << "Tracked packed particles transferred momentum and conserved material\n";
 }

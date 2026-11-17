@@ -35,6 +35,7 @@ bool World::load_boxes(const int32_t *layout, size_t length) {
     std::fill(liquid_head.begin(), liquid_head.end(), 0);
     grains.clear();
     gravel.clear();
+    tracked_packed_particles.clear();
     rock_fragments.clear();
     water_positions.clear();
     liquid_motion.clear();
@@ -118,6 +119,44 @@ bool World::load_boxes(const int32_t *layout, size_t length) {
     ++sand_revision;
     ++rock_revision;
     return true;
+}
+
+float World::packed_particle_mass(int extent) {
+    if (extent != 2 && extent != 4 && extent != 8) return 0.f;
+    return particle_mass(Gravel, extent);
+}
+
+int64_t World::spawn_packed_particle(Vec3 position, int extent, Vec3 impulse) {
+    const float mass = packed_particle_mass(extent);
+    if (mass == 0.f || !position.is_finite() || !std::isfinite(impulse.length_squared()) ||
+            next_packed_handle == std::numeric_limits<int64_t>::max()) return 0;
+    const float offset = (extent - 1) * scale * 0.5f;
+    const I3 origin = grid(position - V3(offset, offset, offset));
+    const I3 edge(extent - 1, extent - 1, extent - 1);
+    if (!inside(origin) || !inside(origin + edge)) return 0;
+    const int index = flat(origin);
+    bool free = true;
+    each_cube(index, extent, [&](int i) { free &= voxels[i].kind == Empty && !body_at(i); });
+    if (!free) return 0;
+
+    const int slot = int(gravel.size());
+    gravel.emplace_back(index, index, tick, extent, (impulse / mass).limit_length(maximum_swept_speed),
+        position - particle_center(origin, extent));
+    each_cube(index, extent, [&](int i) { voxels[i] = {Gravel, voxel_stamp, slot}; });
+    const int64_t handle = next_packed_handle++;
+    tracked_packed_particles.emplace(handle, slot);
+    wake_box(origin, origin + edge, awake);
+    ++sand_revision;
+    return handle;
+}
+
+std::optional<PackedParticleState> World::packed_particle_state(int64_t handle) const {
+    const auto entry = tracked_packed_particles.find(handle);
+    if (entry == tracked_packed_particles.end()) return std::nullopt;
+    const Grain &grain = gravel[entry->second];
+    const Vec3 center = particle_center(decode(grain.position), grain.extent);
+    const Vec3 previous = grain.moved == tick ? particle_center(decode(grain.previous), grain.extent) : center;
+    return PackedParticleState{center, previous, grain.velocity, grain.extent};
 }
 
 void World::step() {

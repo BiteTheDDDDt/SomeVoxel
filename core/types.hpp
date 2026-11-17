@@ -73,6 +73,11 @@ struct ImpactInfo {
     float speed, impulse;
 };
 
+struct PackedParticleState {
+    Vec3 position, previous_position, velocity;
+    int extent = 0;
+};
+
 using TargetContacts = std::vector<std::pair<int, float>>;
 
 } // namespace somevoxel

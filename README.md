@@ -14,6 +14,8 @@ In a CMake consumer, use `add_subdirectory` and link `SomeVoxel::Core`. Include 
 
 The default grid has 4.5 cm cells and runs at 120 Hz. Its dimensions and refinement are build settings. The API is experimental.
 
+`spawn_packed_particle` inserts a cube of packed material with an edge of 2, 4, or 8 cells and an optional impulse in newton-seconds. It returns a handle on success or zero if the volume is unavailable. Use `packed_particle_state` to query its grid position and velocity. Reloading the world or fracturing the packed cube invalidates its handle.
+
 ## Build the Godot extension
 
 The extension build requires Python in addition to CMake and a C++ compiler. CMake fetches and verifies a pinned archive of the Godot 4.6 bindings. Build and install the addon into a Godot project:

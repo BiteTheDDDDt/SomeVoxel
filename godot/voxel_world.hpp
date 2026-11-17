@@ -35,6 +35,10 @@ protected:
         using godot::D_METHOD;
         ClassDB::bind_method(D_METHOD("load_boxes", "layout"), &VoxelWorld::load_boxes);
         ClassDB::bind_method(D_METHOD("step"), &VoxelWorld::step);
+        ClassDB::bind_method(D_METHOD("packed_particle_mass", "extent"), &VoxelWorld::packed_particle_mass);
+        ClassDB::bind_method(D_METHOD("spawn_packed_particle", "position", "extent", "impulse"),
+            &VoxelWorld::spawn_packed_particle, DEFVAL(V3()));
+        ClassDB::bind_method(D_METHOD("packed_particle_state", "handle"), &VoxelWorld::packed_particle_state);
         ClassDB::bind_method(D_METHOD("gravity_acceleration"), &VoxelWorld::gravity_acceleration);
         ClassDB::bind_method(D_METHOD("set_field", "point", "active"), &VoxelWorld::set_field);
         ClassDB::bind_method(D_METHOD("set_cast_profile", "radius_scale", "strength"), &VoxelWorld::set_cast_profile);
@@ -109,6 +113,26 @@ protected:
 public:
     bool load_boxes(const godot::PackedInt32Array &layout) {
         return world.load_boxes(layout.ptr(), layout.size());
+    }
+
+    float packed_particle_mass(int extent) const {
+        return World::packed_particle_mass(extent);
+    }
+
+    int64_t spawn_packed_particle(V3 position, int extent, V3 impulse) {
+        return world.spawn_packed_particle(from_godot(position), extent, from_godot(impulse));
+    }
+
+    godot::Dictionary packed_particle_state(int64_t handle) const {
+        const auto state = world.packed_particle_state(handle);
+        godot::Dictionary result;
+        if (state) {
+            result["position"] = to_godot(state->position);
+            result["previous_position"] = to_godot(state->previous_position);
+            result["velocity"] = to_godot(state->velocity);
+            result["extent"] = state->extent;
+        }
+        return result;
     }
 
     godot::Dictionary status() const {
