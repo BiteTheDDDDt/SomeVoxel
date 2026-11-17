@@ -999,6 +999,26 @@ private:
     static uint8_t grain_face_bit(int axis, int direction) { return uint8_t(1u << (2 * axis + (direction > 0))); }
     static uint8_t grain_axis_faces(int axis) { return uint8_t(3u << (2 * axis)); }
 
+    bool resting_sand(I3 p, int index, Grain &grain) {
+        if (grain.velocity != V3() || winding || !airborne_earth_ejecta.empty() || p.y == 0) return false;
+        const int below = index - slice;
+        const Kind support = voxels[below].kind;
+        if (support == Empty || support == Water) return false;
+        if (pulling) {
+            const float reach = granular_material(Sand).attraction_range * cast_radius_scale;
+            const V3 offset = field - particle_center(p, grain.extent) - grain.travel;
+            if (offset.length_squared() < reach * reach) return false;
+        }
+        for (I3 side : cardinal())
+            if (can_enter(p + side, Sand) && can_enter(p + side + I3(0, -1, 0), Sand)) return false;
+
+        // Apply the same support bookkeeping as the zero-velocity solver exit.
+        grain.travel.y = 0.f;
+        grain.blocked_faces &= uint8_t(~grain_axis_faces(1));
+        if (retains_grain_face(below)) grain.blocked_faces |= grain_face_bit(1, -1);
+        return true;
+    }
+
     bool retains_grain_face(int obstacle) const {
         if (obstacle < 0 || mobile_at(obstacle)) return false;
         const Kind surface = voxels[obstacle].kind;
@@ -1264,6 +1284,7 @@ private:
         }
         if (kind == Sand || kind == Rock) {
             Grain &grain = kind == Sand ? grains[voxel.occupant] : rock_fragments[voxel.occupant];
+            if (kind == Sand && resting_sand(p, index, grain)) return;
             const ParticlePath path = advance_particle(grain, p, kind, [&](I3 candidate, int *contact = nullptr) {
                 return can_enter(candidate, kind, contact);
             });
