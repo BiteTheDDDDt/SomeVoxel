@@ -9,8 +9,8 @@ private:
     static constexpr int pressure_face_budget = 2048;
     using LiquidHead = std::conditional_t<(ny <= 255), uint8_t, uint16_t>;
     std::array<std::vector<int>, ny> water_by_height;
-    std::vector<LiquidHead> liquid_head = std::vector<LiquidHead>(nx * ny * nz);
-    std::vector<LiquidHead> previous_head = std::vector<LiquidHead>(nx * ny * nz);
+    std::vector<LiquidHead> liquid_head;
+    std::vector<LiquidHead> previous_water_heads;
     std::vector<int> pressure_component;
     std::vector<PressureNode> pressure_nodes;
     std::vector<int> pressure_sources;
@@ -114,6 +114,8 @@ private:
     }
 
     void refresh_liquid_head() {
+        if (water_positions.empty()) return;
+        if (liquid_head.empty()) liquid_head.resize(voxels.size());
         const std::array<int64_t, 7> revisions{water_topology_version, stone_version, rock_revision, sand_revision,
             elements_version, water_form_revision, int64_t(liquid_motion.size())};
         const bool balance = tick % pressure_interval == 0 && (pressure_revision != revisions ||
@@ -128,9 +130,13 @@ private:
             pressure_nodes.resize(water_positions.size());
         }
 
-        previous_head.swap(liquid_head);
+        // Only occupied water cells participate in the wake comparison. Keep
+        // the snapshot by parcel ID for the duration of this rebuild.
+        previous_water_heads.resize(water_positions.size());
         for (auto &height : water_by_height) height.clear();
-        for (int i : water_positions) {
+        for (size_t id = 0; id < water_positions.size(); ++id) {
+            const int i = water_positions[id];
+            previous_water_heads[id] = liquid_head[i];
             liquid_head[i] = 0;
             water_by_height[i / slice].push_back(i);
         }
@@ -139,7 +145,7 @@ private:
         for (int y = ny - 1; y >= 0; --y) {
             const LiquidHead head = y + 1;
             for (int seed : water_by_height[y]) {
-                if (liquid_head[seed]) continue;
+                if (liquid_head[seed] || voxels[seed].kind != Water) continue;
                 pressure_component.clear();
                 pressure_component.push_back(seed);
                 liquid_head[seed] = head;
@@ -148,15 +154,17 @@ private:
                 for (size_t cursor = 0; cursor < pressure_component.size(); ++cursor) {
                     const int source = pressure_component[cursor];
                     const I3 point = decode(source);
+                    const int source_id = voxels[source].occupant;
                     const auto visit = [&](int i) {
                         if (voxels[i].kind != Water || liquid_head[i]) return;
                         liquid_head[i] = head;
                         pressure_component.push_back(i);
                         if (record_routes) {
-                            pressure_nodes[voxels[i].occupant] = {source, pressure_nodes[voxels[source].occupant].depth + 1};
+                            pressure_nodes[voxels[i].occupant] = {source, pressure_nodes[source_id].depth + 1};
                         }
                     };
-                    if (head != previous_head[source]) awake[chunk_id({point.x / block, point.y / block, point.z / block})] = true;
+                    if (head != previous_water_heads[source_id])
+                        awake[chunk_id({point.x / block, point.y / block, point.z / block})] = true;
                     if (point.x < nx - 1) visit(source + 1);
                     if (point.x > 0) visit(source - 1);
                     if (point.y < ny - 1) visit(source + slice);

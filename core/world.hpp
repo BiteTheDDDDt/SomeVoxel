@@ -151,6 +151,7 @@ private:
     std::vector<int> visible_sand;
     int64_t visibility_revision = -1;
     std::vector<int> water_positions;
+    // Current and proposed occupancy use one two-bit field per voxel.
     std::vector<uint8_t> body_mask;
     std::vector<int> body_cells;
     std::vector<int> body_next;
@@ -427,7 +428,15 @@ private:
         if (kind == Preset36) return 8;
         return 0;
     }
-    bool body_at(int i) const { return !body_mask.empty() && body_mask[i] != 0; }
+    uint8_t body_flags(int i) const {
+        return (body_mask[i / 4] >> ((i % 4) * 2)) & 3;
+    }
+    void set_body_flags(int i, uint8_t flags) {
+        const int shift = (i % 4) * 2;
+        uint8_t &lane = body_mask[i / 4];
+        lane = uint8_t((lane & ~(3u << shift)) | (flags << shift));
+    }
+    bool body_at(int i) const { return !body_mask.empty() && body_flags(i) != 0; }
 
     void set_rock(int i) {
         const I3 p = decode(i);
@@ -1289,7 +1298,8 @@ private:
         }
         // Pressurized water fans out sideways. A single idle surface layer can
         // settle instead of shuffling continuously across a level floor.
-        if (level != p && (kind == Water ? liquid_head[index] > p.y + 1 : kind_at(p + I3(0, 1, 0)) == Lava))
+        if (level != p && (kind == Water ? !liquid_head.empty() && liquid_head[index] > p.y + 1
+                                         : kind_at(p + I3(0, 1, 0)) == Lava))
             move(p, level);
     }
 
@@ -1511,7 +1521,7 @@ public:
 
     void remove_body() {
         for (int i : body_cells) {
-            body_mask[i] = 0;
+            set_body_flags(i, 0);
             wake_near(decode(i), awake);
         }
         body_cells.clear();
@@ -1529,10 +1539,10 @@ public:
                 if (material == Water) displaced.push_back(i);
                 return true;
             })) return false;
-        if (body_mask.empty()) body_mask.resize(voxels.size(), 0);
+        if (body_mask.empty()) body_mask.resize((voxels.size() + 3) / 4, 0);
         constexpr uint8_t current_body = 1;
         constexpr uint8_t proposed_body = 2;
-        for (int i : body_next) body_mask[i] |= proposed_body;
+        for (int i : body_next) set_body_flags(i, body_flags(i) | proposed_body);
         std::vector<int> destinations;
         if (!displaced.empty()) {
             struct WaterComponent {
@@ -1597,7 +1607,7 @@ public:
                 --components[root(component)].pending;
                 // Open space inside the proposed cylinder can connect an
                 // interior drop to its boundary. Only exterior cells store water.
-                if (voxels[i].kind == Empty && !(body_mask[i] & proposed_body)) {
+                if (voxels[i].kind == Empty && !(body_flags(i) & proposed_body)) {
                     exits.push_back(i);
                     auto &group = components[root(component)];
                     if (group.capacity < group.demand) --unfilled;
@@ -1611,7 +1621,7 @@ public:
                     const int neighbor = flat(next);
                     // The part of the body that was and will stay occupied
                     // cannot conduct flow across the character.
-                    if (body_mask[neighbor] == (current_body | proposed_body)) continue;
+                    if (body_flags(neighbor) == (current_body | proposed_body)) continue;
                     const Kind kind = voxels[neighbor].kind;
                     if (kind != Empty && kind != Water) continue;
                     // Pressure climbs a wet column readily. Shallow water
@@ -1633,8 +1643,8 @@ public:
                 if (components[group].pending == 0 && deficit(group) > 0) break;
             }
             if (unfilled > 0) {
-                for (int i : body_next) body_mask[i] = 0;
-                for (int i : body_cells) body_mask[i] = current_body;
+                for (int i : body_next) set_body_flags(i, 0);
+                for (int i : body_cells) set_body_flags(i, current_body);
                 return false;
             }
             // The whole move is feasible. Assign the closest visited exits to
@@ -1654,11 +1664,11 @@ public:
             }
         }
         for (int i : body_cells) {
-            if (body_mask[i] & proposed_body) continue;
-            body_mask[i] = 0;
+            if (body_flags(i) & proposed_body) continue;
+            set_body_flags(i, 0);
             wake_near(decode(i), awake);
         }
-        for (int i : body_next) body_mask[i] = current_body;
+        for (int i : body_next) set_body_flags(i, current_body);
         for (size_t i = 0; i < destinations.size(); ++i) {
             const I3 from = decode(displaced[i]), to = decode(destinations[i]);
             move(from, to);
@@ -1952,7 +1962,7 @@ public:
         data.voxel_bytes = sizeof(Voxel);
         data.grain_bytes = sizeof(Grain);
         data.dense_grid_bytes = voxels.size() * sizeof(Voxel) + mobile_rows.size() + bulk_water_rows.size() +
-            (liquid_head.size() + previous_head.size()) * sizeof(LiquidHead) +
+            (liquid_head.size() + previous_water_heads.capacity()) * sizeof(LiquidHead) +
             body_mask.size() + support_seen.size() * sizeof(SupportStamp);
         data.sand = grains.size();
         data.gravel = gravel.size();

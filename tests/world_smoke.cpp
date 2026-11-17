@@ -4,6 +4,16 @@
 int main() {
     using somevoxel::World;
     World world;
+    const auto empty_grid = world.status().dense_grid_bytes;
+    const int32_t floor[] = {0, 0, 0, 32, 1, 32, World::Stone};
+    if (!world.load_boxes(floor, sizeof(floor) / sizeof(floor[0]))) return 1;
+    const auto dry_grid = world.status().dense_grid_bytes;
+    world.step();
+    world.step();
+    if (world.status().dense_grid_bytes != dry_grid || dry_grid <= empty_grid) {
+        std::cerr << "A dry step allocated liquid pressure storage\n";
+        return 1;
+    }
     const int32_t layout[] = {
         0, 0, 0, 32, 1, 32, World::Stone,
         4, 8, 4, 8, 12, 8, World::Sand,
