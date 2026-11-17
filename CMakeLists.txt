@@ -1,0 +1,27 @@
+cmake_minimum_required(VERSION 3.24)
+project(SomeVoxel LANGUAGES CXX)
+
+set(SOMEVOXEL_REFINEMENT 4 CACHE STRING "Subdivisions of each 18 cm layout cell")
+option(SOMEVOXEL_WIDE_GRID "Use wide grid metadata for profiling" OFF)
+option(SOMEVOXEL_BUILD_GODOT "Build the Godot GDExtension" OFF)
+
+add_library(somevoxel_core STATIC core/world.cpp)
+add_library(SomeVoxel::Core ALIAS somevoxel_core)
+target_compile_features(somevoxel_core PUBLIC cxx_std_17)
+target_include_directories(somevoxel_core PUBLIC "${CMAKE_CURRENT_SOURCE_DIR}")
+target_compile_definitions(somevoxel_core PUBLIC SOMEVOXEL_REFINEMENT=${SOMEVOXEL_REFINEMENT})
+set_target_properties(somevoxel_core PROPERTIES POSITION_INDEPENDENT_CODE ON)
+if(SOMEVOXEL_WIDE_GRID)
+    target_compile_definitions(somevoxel_core PUBLIC SOMEVOXEL_WIDE_GRID)
+endif()
+
+include(CTest)
+if(BUILD_TESTING)
+    add_executable(somevoxel_smoke tests/world_smoke.cpp)
+    target_link_libraries(somevoxel_smoke PRIVATE SomeVoxel::Core)
+    add_test(NAME somevoxel_world COMMAND somevoxel_smoke)
+endif()
+
+if(SOMEVOXEL_BUILD_GODOT)
+    add_subdirectory(godot)
+endif()

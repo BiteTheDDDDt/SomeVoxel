@@ -1,0 +1,7 @@
+[configuration]
+entry_symbol = "somevoxel_init"
+compatibility_minimum = "4.6"
+
+[libraries]
+windows.x86_64 = "res://addons/somevoxel/bin/somevoxel.dll"
+linux.x86_64 = "res://addons/somevoxel/bin/libsomevoxel.so"
