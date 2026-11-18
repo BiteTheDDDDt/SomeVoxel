@@ -25,6 +25,7 @@ layout(push_constant, std430) uniform Params {
     vec4 field;
     ivec4 region_origin;
     ivec4 region_size_limit;
+    ivec4 body;
 };
 
 const uint GROUP_WIDTH = 128u;
@@ -32,6 +33,19 @@ const uint GROUP_LIMIT = 16384u;
 
 bool inside(ivec3 p) {
     return all(greaterThanEqual(p, ivec3(0))) && all(lessThan(p, bounds_mode.xyz));
+}
+
+bool inside_body(ivec3 p) {
+    int half_width = body.w & 65535;
+    int height = body.w >> 16;
+    return p.y >= body.y && p.y < body.y + height
+        && all(lessThan(abs(p.xz - body.xz), ivec2(half_width)));
+}
+
+vec3 body_acceleration(ivec3 p) {
+    ivec2 offset = p.xz - body.xz;
+    if (abs(offset.x) >= abs(offset.y)) return vec3(offset.x >= 0 ? 0.8 : -0.8, 0.0, 0.0);
+    return vec3(0.0, 0.0, offset.y >= 0 ? 0.8 : -0.8);
 }
 
 int tile_key(ivec3 tile) {
@@ -79,14 +93,17 @@ void integrate_field(uint invocation) {
     ivec4 page = pages[invocation >> 9];
     int local = int(invocation & 511u);
     int location = page.w * 512 + local;
-    if (atlas[location] != 2) return;
+    int kind = atlas[location];
+    if (kind != 2 && kind != 3) return;
     uint previous = flags[location];
     ivec3 p = page.xyz + local_cell(local);
     vec3 delta = focus.xyz - vec3(p);
     float distance_sq = dot(delta, delta);
-    bool affected = field.x > 0.0 && distance_sq < focus.w;
-    if (!affected && (previous >> 2) == 0u) return;
+    bool affected = kind == int(field.z) && field.x > 0.0 && distance_sq < focus.w;
+    bool body_contact = body.w != 0 && inside_body(p);
+    if (!affected && !body_contact && (previous >> 2) == 0u) return;
     vec3 acceleration = vec3(0.0, -0.125, 0.0);
+    if (body_contact) acceleration += body_acceleration(p);
     if (affected && distance_sq > 0.0) {
         float distance = sqrt(distance_sq);
         // Linear falloff at the field boundary and a soft center.
@@ -101,7 +118,7 @@ void integrate_field(uint invocation) {
         ivec3 neighbor = p;
         neighbor[axis] += sign(velocity);
         int obstacle = material(address(neighbor));
-        if (obstacle != 0 && obstacle != 3) continue;
+        if (obstacle != 0 && !(kind == 2 && obstacle == 3)) continue;
         int shift = 2 + axis * 9;
         int fraction = sign(velocity) == sign(last) ? int(bitfieldExtract(previous, shift + 5, 4)) : 0;
         fraction += abs(velocity);
@@ -117,7 +134,7 @@ void add_impulse(uint invocation) {
     ivec4 page = pages[invocation >> 9];
     int index = int(invocation & 511u);
     int location = page.w * 512 + index;
-    if (atlas[location] != 2) return;
+    if (atlas[location] != axis_parity_count.z) return;
     vec3 delta = vec3(page.xyz + local_cell(index)) - focus.xyz;
     float distance_sq = dot(delta, delta);
     if (distance_sq >= focus.w) return;
@@ -170,14 +187,21 @@ void exchange_pairs(uint invocation) {
     if (b < 0 || writable[b / 512] == 0) return;
     int left = atlas[a], right = atlas[b];
     if (left == right) return;
+    if (body.w != 0) {
+        bool a_inside = inside_body(p), b_inside = inside_body(q);
+        // Existing grains can move out, but moving grains cannot enter.
+        if (a_inside != b_inside && (a_inside ? right != 0 : left != 0)) return;
+    }
     uint af = flags[a], bf = flags[b];
     uint ready = ready_bit(axis);
     bool swap = false;
-    if (axis_parity_count.w != 0 && left == 2 && (right == 0 || right == 3) && (af >> 2) != 0u) {
+    if (axis_parity_count.w != 0 && left >= 2 && (right == 0 || (left == 2 && right == 3)) && (af >> 2) != 0u) {
         swap = (af & ready) != 0u && speed(af, axis) > 0;
-    } else if (axis_parity_count.w != 0 && right == 2 && (left == 0 || left == 3) && (bf >> 2) != 0u) {
+    } else if (axis_parity_count.w != 0 && right >= 2 && (left == 0 || (right == 2 && left == 3)) && (bf >> 2) != 0u) {
         swap = (bf & ready) != 0u && speed(bf, axis) < 0;
     } else if (axis == 1) swap = (left == 0 && (right == 2 || right == 3)) || (left == 3 && right == 2);
+    else if (region_origin.w != 0 && left == 2 && right == 0) swap = (af & 1u) == 0u && (bf & 1u) != 0u;
+    else if (region_origin.w != 0 && right == 2 && left == 0) swap = (bf & 1u) == 0u && (af & 1u) != 0u;
     else if (left == 3 && right == 0) {
         swap = (af & 1u) == 0u && ((bf & 1u) != 0u || ((af & 2u) != 0u && (bf & 2u) == 0u));
     } else if (right == 3 && left == 0) {
@@ -189,6 +213,81 @@ void exchange_pairs(uint invocation) {
         if (axis_parity_count.w != 0) {
             flags[a] = (af & 3u) | (bf & ~(3u | ready));
             flags[b] = (bf & 3u) | (af & ~(3u | ready));
+        }
+    }
+}
+
+// Top contiguous run for each moving material. Uniform air and stone pages
+// need one directory lookup per eight cells.
+void column_map(uint invocation) {
+    ivec2 dimensions = region_size_limit.xz;
+    if (invocation >= uint(dimensions.x * dimensions.y)) return;
+    int stride = region_size_limit.w;
+    ivec2 column = ivec2(int(invocation) % dimensions.x, int(invocation) / dimensions.x);
+    ivec2 xz = min(column * stride + stride / 2, bounds_mode.xz - 1);
+    ivec4 spans = ivec4(0);
+    bool sand_done = false, water_done = false;
+    for (int y = bounds_mode.y - 1; y >= 0 && !(sand_done && water_done);) {
+        int slot = directory[tile_key(ivec3(xz.x, y, xz.y) / 8)];
+        int bottom = y & ~7;
+        if (slot < 0) {
+            sand_done = spans.y != 0;
+            water_done = spans.w != 0;
+            y = bottom - 1;
+            continue;
+        }
+        int local = (xz.x & 7) + 8 * (xz.y & 7);
+        for (; y >= bottom && !(sand_done && water_done); y--) {
+            int kind = atlas[slot * 512 + local + 64 * (y & 7)];
+            if (!sand_done && kind == 2) {
+                if (spans.y == 0) spans.y = y + 1;
+                spans.x = y;
+            } else if (spans.y != 0) sand_done = true;
+            if (!water_done && kind == 3) {
+                if (spans.w == 0) spans.w = y + 1;
+                spans.z = y;
+            } else if (spans.w != 0) water_done = true;
+        }
+    }
+    cells[invocation] = ivec4(floatBitsToInt(vec4(spans)));
+}
+
+void trace_ray() {
+    vec3 direction = field.xyz;
+    float entry = 0.0, exit = focus.w;
+    cells[0] = ivec4(0);
+    for (int axis = 0; axis < 3; axis++) {
+        if (abs(direction[axis]) < 1e-8) {
+            if (focus[axis] < 0.0 || focus[axis] >= float(bounds_mode[axis])) return;
+            continue;
+        }
+        float a = -focus[axis] / direction[axis];
+        float b = (float(bounds_mode[axis]) - focus[axis]) / direction[axis];
+        entry = max(entry, min(a, b));
+        exit = min(exit, max(a, b));
+    }
+    if (entry > exit) return;
+    ivec3 p = ivec3(floor(focus.xyz + direction * min(entry + 0.0001, exit)));
+    p = clamp(p, ivec3(0), bounds_mode.xyz - 1);
+    ivec3 advance = ivec3(sign(direction));
+    vec3 next = vec3(1e30), spacing = vec3(1e30);
+    for (int axis = 0; axis < 3; axis++) {
+        if (abs(direction[axis]) < 1e-8) continue;
+        spacing[axis] = abs(1.0 / direction[axis]);
+        next[axis] = (float(p[axis] + (advance[axis] > 0 ? 1 : 0)) - focus[axis]) / direction[axis];
+    }
+    while (inside(p) && entry <= exit) {
+        int kind = material(address(p));
+        if ((axis_parity_count.z & (1 << kind)) != 0) {
+            cells[0] = ivec4(floatBitsToInt(focus.xyz + direction * entry), kind);
+            return;
+        }
+        entry = min(next.x, min(next.y, next.z));
+        for (int axis = 0; axis < 3; axis++) {
+            if (next[axis] <= entry) {
+                p[axis] += advance[axis];
+                next[axis] += spacing[axis];
+            }
         }
     }
 }
@@ -280,6 +379,8 @@ void main() {
     else if (mode == 8) integrate_field(invocation);
     else if (mode == 9) add_impulse(invocation);
     else if (mode == 10) extract_surface(invocation);
+    else if (mode == 11) column_map(invocation);
+    else if (mode == 12 && invocation == 0u) trace_ray();
     else if (mode >= 4 && invocation < uint(axis_parity_count.z)) {
         ivec3 p = cells[invocation].xyz;
         if (mode == 4) ensure_page(p & ~7, true);

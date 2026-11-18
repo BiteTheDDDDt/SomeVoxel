@@ -9,7 +9,10 @@ const MAX_SURFACE_VOLUME := 2_000_000
 
 enum Kind { AIR, STONE, SAND, WATER }
 enum Buffer { DIRECTORY, ATLAS, ORIGINS, WRITABLE, SUPPORT, COUNTERS, INDIRECT, COMMANDS }
-enum Pass { SUPPORT, EXCHANGE, FRONTIER, PUBLISH, RESERVE, VALIDATE, WRITE, SAMPLE, INTEGRATE, IMPULSE, SURFACE }
+enum Pass {
+	SUPPORT, EXCHANGE, FRONTIER, PUBLISH, RESERVE, VALIDATE, WRITE, SAMPLE,
+	INTEGRATE, IMPULSE, SURFACE, COLUMNS, RAY,
+}
 
 var _rd: RenderingDevice
 var _shader := RID()
@@ -23,6 +26,7 @@ var _bytes := 0
 var _tick := 0
 var _motion_started := false
 var _pending := false
+var granular_sliding := false
 
 func load_boxes(bounds: Vector3i, boxes: PackedInt32Array, max_resident_pages := 0) -> bool:
 	var layout := PageLayout.new()
@@ -91,7 +95,7 @@ func _load_layout(layout: RefCounted, max_resident_pages: int) -> bool:
 	_bounds = layout.bounds
 	_capacity = capacity
 	_rd.buffer_clear(_buffers[Buffer.SUPPORT], 0, sizes[Buffer.SUPPORT])
-	_push.resize(112)
+	_push.resize(128)
 	_push.encode_s32(0, layout.shape.x)
 	_push.encode_s32(4, layout.shape.y)
 	_push.encode_s32(8, layout.shape.z)
@@ -104,9 +108,9 @@ func _load_layout(layout: RefCounted, max_resident_pages: int) -> bool:
 	_finish()
 	return true
 
-## Adds velocity in cells per step to sand inside a sphere, with linear falloff.
-func apply_impulse(center: Vector3, radius: float, velocity: Vector3) -> bool:
-	if _rd == null or not center.is_finite() or not velocity.is_finite():
+## Adds velocity in cells per step to one material inside a sphere, with linear falloff.
+func apply_impulse(center: Vector3, radius: float, velocity: Vector3, kind := Kind.SAND) -> bool:
+	if _rd == null or not center.is_finite() or not velocity.is_finite() or (kind != Kind.SAND and kind != Kind.WATER):
 		return false
 	if not is_finite(radius) or radius <= 0.0 or radius > 1e8:
 		return false
@@ -122,7 +126,7 @@ func apply_impulse(center: Vector3, radius: float, velocity: Vector3) -> bool:
 	_push.encode_float(72, velocity.z)
 	_push.encode_float(76, 1.0 / maxf(radius, 1e-8))
 	var commands := _begin()
-	_dispatch(commands, Pass.IMPULSE, 0, 0, 0, 0)
+	_dispatch(commands, Pass.IMPULSE, 0, 0, kind, 0)
 	_finish()
 	_motion_started = true
 	return true
@@ -151,17 +155,76 @@ func surface_cells(origin: Vector3i, size: Vector3i, limit := MAX_BATCH) -> Dict
 		cells = _rd.buffer_get_data(_buffers[Buffer.COMMANDS], 0, mini(total, limit) * 16).to_int32_array()
 	return {"total": total, "cells": cells}
 
-func step(count := 1, focus := Vector3.ZERO, radius := 0.0, expand := true, strength := 0.8) -> bool:
-	if not submit_steps(count, focus, radius, expand, strength):
+## One RGBA32F texel per sampled column, in X/Z order. Channels are the
+## inclusive base and exclusive top of the highest sand and water runs.
+func column_map(stride: int) -> Image:
+	if _rd == null or stride <= 0:
+		return null
+	var width := ceili(float(_bounds.x) / stride)
+	var depth := ceili(float(_bounds.z) / stride)
+	if width * depth > MAX_BATCH or width > 16384 or depth > 16384:
+		return null
+	_push.encode_s32(96, width)
+	_push.encode_s32(104, depth)
+	_push.encode_s32(108, stride)
+	var commands := _begin()
+	_dispatch(commands, Pass.COLUMNS, 0, 0, width * depth)
+	_finish()
+	var data := _rd.buffer_get_data(_buffers[Buffer.COMMANDS], 0, width * depth * 16)
+	return Image.create_from_data(width, depth, false, Image.FORMAT_RGBAF, data)
+
+## Traces the authoritative GPU grid in cell coordinates. Bit 1 << Kind
+## enables a material. The returned position is INF when the ray misses.
+func ray_hit(origin: Vector3, direction: Vector3, distance: float, material_mask := 14) -> Vector3:
+	if _rd == null or not origin.is_finite() or not direction.is_finite() or direction.is_zero_approx():
+		return Vector3.INF
+	if not is_finite(distance) or distance <= 0.0 or material_mask <= 0 or material_mask > 14 or material_mask & 1:
+		return Vector3.INF
+	direction = direction.normalized()
+	for axis in 3:
+		_push.encode_float(48 + 4 * axis, origin[axis])
+		_push.encode_float(64 + 4 * axis, direction[axis])
+	_push.encode_float(60, distance)
+	var commands := _begin()
+	_dispatch(commands, Pass.RAY, 0, 0, material_mask)
+	_finish()
+	var data := _rd.buffer_get_data(_buffers[Buffer.COMMANDS], 0, 16)
+	if data.decode_s32(12) == 0:
+		return Vector3.INF
+	return Vector3(data.decode_float(0), data.decode_float(4), data.decode_float(8))
+
+## Defines a kinematic obstacle for particles. It blocks entry and pushes
+## existing particles toward the nearest open side over subsequent steps.
+func set_kinematic_box(base: Vector3i, half_width: int, height: int) -> bool:
+	if _rd == null or half_width <= 0 or half_width > 65535 or height <= 0 or height > 32767:
+		return false
+	if base != base.clamp(-Vector3i(65535, 32767, 65535), _bounds + Vector3i(65535, 32767, 65535)):
+		return false
+	for axis in 3:
+		_push.encode_s32(112 + 4 * axis, base[axis])
+	_push.encode_s32(124, half_width | (height << 16))
+	_motion_started = true
+	return true
+
+func clear_kinematic_box() -> void:
+	if _rd != null:
+		_push.encode_s32(124, 0)
+
+func step(count := 1, focus := Vector3.ZERO, radius := 0.0, expand := true,
+		strength := 0.8, kind := Kind.SAND) -> bool:
+	if not submit_steps(count, focus, radius, expand, strength, kind):
 		return false
 	wait_for_steps()
 	return true
 
 ## Runs the GPU while the caller does other work. A second submission waits for the first.
-func submit_steps(count := 1, focus := Vector3.ZERO, radius := 0.0, expand := true, strength := 0.8) -> bool:
+func submit_steps(count := 1, focus := Vector3.ZERO, radius := 0.0, expand := true,
+		strength := 0.8, kind := Kind.SAND) -> bool:
 	if _rd == null or count < 1 or count > 1024 or not focus.is_finite():
 		return false
 	if not is_finite(radius) or radius < 0.0 or radius > 1e8 or not is_finite(strength) or strength < 0.0 or strength > 16.0:
+		return false
+	if kind != Kind.SAND and kind != Kind.WATER:
 		return false
 	_motion_started = _motion_started or (radius > 0.0 and strength > 0.0)
 	_push.encode_s32(44, int(_motion_started))
@@ -171,6 +234,8 @@ func submit_steps(count := 1, focus := Vector3.ZERO, radius := 0.0, expand := tr
 	_push.encode_float(60, radius * radius if strength > 0.0 else 0.0)
 	_push.encode_float(64, strength)
 	_push.encode_float(68, 1.0 / maxf(radius, 1e-8))
+	_push.encode_float(72, float(kind))
+	_push.encode_s32(92, int(granular_sliding))
 	var commands := _begin()
 	for _i in count:
 		if expand:
@@ -178,7 +243,8 @@ func submit_steps(count := 1, focus := Vector3.ZERO, radius := 0.0, expand := tr
 			_dispatch(commands, Pass.PUBLISH)
 		if _motion_started:
 			_dispatch(commands, Pass.INTEGRATE, 0, 0, 0, 0)
-		for axis in [1, 0, 2]:
+		var axes := [1, 2, 0] if granular_sliding and (_tick & 1) != 0 else [1, 0, 2]
+		for axis in axes:
 			if axis != 1:
 				_dispatch(commands, Pass.SUPPORT, 0, 0, 0, 0)
 			_dispatch(commands, Pass.EXCHANGE, axis, _tick & 1, 0, 12)
@@ -273,6 +339,7 @@ func close() -> void:
 	_pipeline = RID()
 	_shader = RID()
 	_buffers.clear()
+	_push.clear()
 	_bounds = Vector3i.ZERO
 	_capacity = 0
 	_bytes = 0

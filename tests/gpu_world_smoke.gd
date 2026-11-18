@@ -68,7 +68,14 @@ func run() -> void:
 	check(world.status().capacity_misses > 0, "Count rejected allocations")
 	check(world.load_boxes(Vector3i(24, 16, 8), PackedInt32Array([
 		7, 1, 2, 8, 2, 3, World.Kind.SAND,
+		7, 4, 2, 8, 6, 3, World.Kind.WATER,
 	])), "Load impulse scenario")
+	var columns := world.column_map(1)
+	var spans := columns.get_pixel(7, 2)
+	check(Vector4(spans.r, spans.g, spans.b, spans.a).is_equal_approx(Vector4(1, 2, 4, 6)), "Column snapshot preserves separated materials")
+	var hit := world.ray_hit(Vector3(7.5, 20, 2.5), Vector3.DOWN, 22.0, 1 << World.Kind.SAND)
+	check(hit.is_equal_approx(Vector3(7.5, 2, 2.5)), "Ray enters the world and respects the material mask")
+	check(not world.ray_hit(Vector3(9, 20, 2.5), Vector3.DOWN, 22.0).is_finite(), "Empty column is a ray miss")
 	check(world.apply_impulse(Vector3(7, 1, 2), 2.0, Vector3(0.9, 0.6, 0)), "Apply regional impulse")
 	check(world.sample_cells(PackedInt32Array([7, 1, 2]))[0] == 2, "Impulse preserves position until stepping")
 	check(world.submit_steps(6), "Submit GPU steps without waiting")
@@ -77,6 +84,38 @@ func run() -> void:
 		for y in 8:
 			trajectory.append_array(PackedInt32Array([x, y, 2]))
 	check(world.sample_cells(trajectory).has(2), "Query waits for the submitted cross-page impulse trajectory")
+	check(world.load_boxes(Vector3i(16, 16, 16), PackedInt32Array([
+		2, 2, 2, 3, 3, 3, World.Kind.WATER,
+	])), "Load water impulse scenario")
+	check(world.apply_impulse(Vector3(2, 2, 2), 2.0, Vector3(1.0, 0.75, 0), World.Kind.WATER), "Apply impulse to water")
+	world.step(5)
+	var water_column := world.column_map(1)
+	var moved_water := false
+	for x in range(4, 8):
+		moved_water = moved_water or water_column.get_pixel(x, 2).a > 0
+	check(moved_water and material_counts(world, Vector3i(16, 16, 16))[3] == 1, "Water carries directional momentum and conserves mass")
+	check(world.load_boxes(Vector3i(16, 8, 16), PackedInt32Array([
+		0, 0, 0, 16, 1, 16, World.Kind.STONE,
+		6, 1, 6, 9, 2, 9, World.Kind.WATER,
+		3, 1, 3, 4, 5, 4, World.Kind.SAND,
+	])), "Load shallow contact and slope scenario")
+	world.granular_sliding = true
+	check(world.set_kinematic_box(Vector3i(7, 1, 7), 2, 5), "Place kinematic obstacle in water")
+	world.step(24)
+	var shallow := world.column_map(1)
+	var inside_water := 0
+	var maximum_water_height := 0.0
+	for x in 16:
+		for z in 16:
+			var surface_height := shallow.get_pixel(x, z).a
+			maximum_water_height = maxf(maximum_water_height, surface_height)
+			if x >= 6 and x <= 8 and z >= 6 and z <= 8 and surface_height > 0.0:
+				inside_water += 1
+	var final := material_counts(world, Vector3i(16, 8, 16))
+	check(inside_water == 0 and maximum_water_height <= 2.0 and final[3] == 9,
+		"Shallow water moves sideways without losing mass or rising above the body")
+	check(shallow.get_pixel(3, 3).g < 5.0 and final[2] == 4, "Unsupported slope edges slide without losing sand")
+	world.clear_kinematic_box()
 	world.close()
 	check(world.status().is_empty(), "Close releases world")
 	if not failed:
