@@ -40,6 +40,25 @@ The rotating phase reduced the mirrored difference at 180/90 Hz to under 1% of t
 
 At 120/90 Hz, a cumulative schedule makes three water updates for every four engine ticks. Keeping the water rate at 90 Hz kept the mirrored tests within 1% of the 180/90 Hz rotating-phase results. The mixed fixture discharged 541.6 L and recorded a 1.350 N·s peak impact.
 
+### Net outlet flow across cell sizes
+
+The water fixture reports the net average in `water_net_flow_l_s`. It counts the water remaining past the outlet plane after five simulated seconds and converts cell count to litres using the cube of the cell size. The outlet side starts dry. Backflow reduces the measured net volume. The `water-narrow` and `water-narrow-mirrored` cases halve the physical width of the main outlet while keeping its height, initial head and reservoir volume.
+
+| Cell size | Bulk rate | Sweep phase | Wide L/s, original / mirrored | Narrow L/s, original / mirrored |
+| --- | ---: | --- | ---: | ---: |
+| 4.5 cm | 60 Hz | Simulation tick | 29.47 / 433.54 | 17.97 / 219.32 |
+| 4.5 cm | 60 Hz | Water tick | 176.49 / 177.57 | 91.25 / 90.25 |
+| 3 cm | 30 Hz | Water tick | 29.52 / 30.49 | 15.82 / 15.65 |
+| 3 cm | 45 Hz | Water tick | 48.47 / 49.42 | 26.12 / 26.13 |
+| 3 cm | 60 Hz | Water tick | 69.84 / 69.25 | 36.73 / 36.90 |
+| 3 cm | 90 Hz | Water tick | 109.14 / 109.84 | 56.87 / 57.83 |
+| 2 cm | 60 Hz | Water tick | 29.48 / 28.45 | 16.25 / 15.64 |
+| 1 cm | 60 Hz | Water tick | 3.38 / 3.16 | 1.88 / 1.71 |
+
+All tests ran the main step at 120 Hz and conserved total water and solid volume. Rotating the 4.5 cm sweep greatly reduces the mirror difference while changing the absolute flow and the ordering of the shared particle pass. At a common 60 Hz, the rotating profiles yield wide-outlet rates of 176.49, 69.84, 29.48 and 3.38 L/s as cell size decreases. Lowering the 3 cm profile to 30 Hz brings it close to the 2 cm fixture at both widths. Physical calibration requires time-resolved outflow at more than one initial head and across resolutions.
+
+In a separate displacement check, a 0.21 m radius body entered 0.90 m of still water. The 4.5, 3, 2 and 1 cm profiles displaced 160.38, 139.32, 141.12 and 130.68 L, respectively. Each placement succeeded, retained total water, and kept the body's central column clear after 32 steps. At 3 cm, the placement result was the same at 30, 60 and 90 Hz.
+
 ## CPU parallel water-head reconstruction
 
 An exact span-based probe reduced mean reconstruction in the mixed fixture from 5.29–5.33 ms to 3.19 ms on one worker and 2.73 ms on eight. Whole-solver P95 improved from 51.0–52.9 ms to 48.0 ms in the eight-worker run, with overlapping timings across worker configurations. All checkpoint digests matched. The prototype currently allocates 31.25 MiB of additional scratch. See [method, randomized tests and reproduction](cpu_parallel_heads.md).

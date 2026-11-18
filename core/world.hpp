@@ -38,7 +38,8 @@ class World {
     static constexpr int bx = nx / block, by = (ny + block - 1) / block, bz = nz / block;
     static constexpr int chunk_count = bx * by * bz;
     static_assert(nx % block == 0 && nz % block == 0);
-    static constexpr float scale = 0.18f / refinement;
+    static constexpr double layout_cell_size = 0.18;
+    static constexpr float scale = float(layout_cell_size) / refinement;
     static constexpr int reference_hz = 30 * refinement;
 #ifdef SOMEVOXEL_EXPERIMENTAL_SIMULATION_HZ
     static constexpr int simulation_hz = SOMEVOXEL_EXPERIMENTAL_SIMULATION_HZ;

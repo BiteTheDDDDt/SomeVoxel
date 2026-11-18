@@ -333,32 +333,36 @@ private:
     }
 
     struct ThrowSample {
-        V3 position_sum;
-        V3 momentum;
-        float mass = 0.f;
-        float impulse = 0.f;
+        std::array<double, 3> position_sum{}, momentum{};
+        double mass = 0.0;
+        double impulse = 0.0;
         float fastest = 0.f;
         int count = 0;
 
         void add(Kind kind, const Grain &grain, float speed = 0.f) {
-            const float weight = particle_mass(kind, grain);
+            const double weight = particle_mass(kind, grain);
             // Keep the estimated launch origin inside the occupied cell.
             constexpr float half = scale * 0.499f;
             const V3 bound(half, half, half);
             const V3 position = particle_center(decode(grain.position), grain.extent) + grain.travel.clamp(-bound, bound);
-            position_sum += position * weight;
-            momentum += grain.velocity * weight;
+            for (int axis = 0; axis < 3; ++axis) {
+                position_sum[axis] += position[axis] * weight;
+                momentum[axis] += grain.velocity[axis] * weight;
+            }
             mass += weight;
             impulse += weight * speed;
             fastest = std::max(fastest, speed);
             ++count;
         }
 
-        float speed() const { return mass > 0.f ? impulse / mass : 0.f; }
+        float speed() const { return mass > 0.0 ? float(impulse / mass) : 0.f; }
 
         ThrowInfo result(float speed) const {
             if (count == 0) return {};
-            return {position_sum / mass, momentum / mass, speed, mass, count};
+            const auto mean = [this](const std::array<double, 3> &sum) {
+                return V3(float(sum[0] / mass), float(sum[1] / mass), float(sum[2] / mass));
+            };
+            return {mean(position_sum), mean(momentum), speed, float(mass), count};
         }
     };
 
@@ -387,29 +391,8 @@ private:
         std::vector<std::pair<float, int>> blocks;
     };
 
-    FreeSandCandidates free_sand_candidates(V3 point) const {
-        FreeSandCandidates candidates;
-        if (!pulling || !point.is_finite() || point.distance_squared_to(field) > 4.f * scale * scale)
-            return candidates;
-        const float reach = free_sand_focus_reach();
-        const float reach_squared = reach * reach;
-        const auto select = [&](const std::vector<Grain> &material, std::vector<std::pair<float, int>> &nearest, size_t limit) {
-            nearest.reserve(std::min(limit, material.size()));
-            for (int i = 0; i < int(material.size()); ++i) {
-                const Grain &grain = material[i];
-                if (voxels[grain.position].formed) continue;
-                const V3 center = particle_center(decode(grain.position), grain.extent);
-                const float distance = free_sand_focus_distance_squared(field, center);
-                if (distance < reach_squared) nearest.emplace_back(distance, i);
-            }
-            if (nearest.size() <= limit) return;
-            std::nth_element(nearest.begin(), nearest.begin() + limit, nearest.end());
-            nearest.resize(limit);
-        };
-        select(grains, candidates.fine, 900);
-        select(gravel, candidates.blocks, 32);
-        return candidates;
-    }
+    static constexpr double free_sand_mass_budget_kg = 131.22;
+    FreeSandCandidates free_sand_candidates(V3 point) const;
 
     float loose_sand_speed(float impulse_scale) const {
         const float effort = std::sqrt(cast_strength * std::clamp(impulse_scale, 0.25f, 6.f));
@@ -438,7 +421,8 @@ private:
         grain.velocity += direction * speed;
         const I3 p = decode(grain.position);
         const int edge = grain.extent - 1;
-        wake_box(p, p + I3(edge, edge, edge), awake);
+        if (edge == 0) wake_near(p, awake);
+        else wake_box(p, p + I3(edge, edge, edge), awake);
     }
 
     bool form_launchable(int index, const FormMotion &motion, V3 margin) const {

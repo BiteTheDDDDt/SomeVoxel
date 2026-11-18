@@ -22,6 +22,8 @@ Alternative CPU and GPU solvers can be tested independently using the [simulatio
 
 `spawn_packed_particle` inserts a cube of packed material with an edge of 2, 4, or 8 cells and an optional impulse in newton-seconds. It returns a handle on success or zero if the volume is unavailable. Use `packed_particle_state` to query its grid position and velocity. Reloading the world or fracturing the packed cube invalidates its handle.
 
+`free_sand_throw()` and `launch_free_sand()` select up to 131.22 kg of loose sand within the active focus, rounded down to whole cells. Packed bodies have a separate selection limit and contribute their actual mass to the charge work calculation. The [rate and precision fixtures](experiments/performance_precision.md) report outflow, impact impulse and fracture volume in physical units.
+
 ## Build the Godot extension
 
 The extension build requires Python in addition to CMake and a C++ compiler. CMake fetches and verifies a pinned archive of the Godot 4.6 bindings. Build and install the addon into a Godot project:

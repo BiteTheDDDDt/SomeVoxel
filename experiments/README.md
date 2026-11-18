@@ -4,6 +4,12 @@ These probes run independently of the production solver. Measurements below used
 
 [Follow-up experiments on rate, CPU reconstruction and numeric precision](performance_precision.md)
 
+### Physical-unit replay
+
+Build `somevoxel_rate_bench` with `-DSOMEVOXEL_BUILD_EXPERIMENTS=ON` and the grid and tick-rate settings to compare. Run `launch-budget` to check the selected loose-sand mass against the 131.22 kg reference with a full supply. Run `wall-sweep` to check that a shot that clears the wall plane in one tick without an obstacle still stops at the face of a one-cell wall. An acceptance check exits with a nonzero status on failure.
+
+`mixed` replays five simulated seconds of reservoir flow and a charged shot. The report gives the mass at release in kilograms, the impulse of the fastest qualifying sand contact in N·s and N·s per square meter of the contact face, and stone fracture volume in liters. As an estimate of the impulse applied at release, `cast_impulse_ns` multiplies released mass by the mass-weighted velocity increment. Use `water`, `water-mirrored`, `water-narrow`, and `water-narrow-mirrored` to compare tank outlets. `water_net_flow_l_s` is the final water volume beyond the fixed outlet plane divided by elapsed simulated seconds. It measures net discharge over the test window.
+
 `paged_material_grid.py` checks initial occupancy on CUDA for fixed scene
 bounds. It accepts JSON lines with a `layout` identifier and flat
 `boxes` records in `[x0,y0,z0,x1,y1,z1,kind]` order. Uniform static pages

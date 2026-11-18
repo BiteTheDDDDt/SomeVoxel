@@ -17,6 +17,73 @@ static int next_row_cell(unsigned row, bool descending) {
 #endif
 }
 
+World::FreeSandCandidates World::free_sand_candidates(V3 point) const {
+    FreeSandCandidates candidates;
+    if (!pulling || !point.is_finite() || point.distance_squared_to(field) > 4.f * scale * scale)
+        return candidates;
+
+    constexpr double nominal_pitch = layout_cell_size / refinement;
+    constexpr double grain_kg = sand_density * nominal_pitch * nominal_pitch * nominal_pitch;
+    // Round down to complete grains. The tolerance absorbs binary rounding
+    // when the physical budget fits an exact number of cells.
+    constexpr size_t fine_limit = std::max(size_t(1), size_t(free_sand_mass_budget_kg / grain_kg + 1e-7));
+    constexpr size_t block_limit = 32;
+    const float reach = free_sand_focus_reach();
+    const float reach_squared = reach * reach;
+    const auto trim = [](auto &nearest, size_t limit) {
+        if (nearest.size() <= limit) return;
+        std::nth_element(nearest.begin(), nearest.begin() + limit, nearest.end());
+        nearest.resize(limit);
+    };
+    const auto consider = [&](auto &nearest, const Voxel &voxel, I3 position, int extent) {
+        if (voxel.formed) return;
+        const float distance = free_sand_focus_distance_squared(field, particle_center(position, extent));
+        if (distance < reach_squared) nearest.emplace_back(distance, voxel.occupant);
+    };
+
+    // The bounds include each candidate center before the exact ellipsoid
+    // test. The world can be mostly empty or contain distant reservoirs of sand.
+    const V3 bounds(reach, reach / 1.4f, reach);
+    const I3 low = grid(field - bounds) - I3(1, 1, 1);
+    const I3 high = grid(field + bounds) + I3(1, 1, 1);
+    const I3 first(std::max(0, low.x), std::max(0, low.y), std::max(0, low.z));
+    const I3 last(std::min(nx - 1, high.x), std::min(ny - 1, high.y), std::min(nz - 1, high.z));
+    if (first.x > last.x || first.y > last.y || first.z > last.z) return candidates;
+    const size_t row_count = size_t(last.x / block - first.x / block + 1) *
+        (last.y - first.y + 1) * (last.z - first.z + 1);
+
+    candidates.fine.reserve(std::min(fine_limit, grains.size()));
+    if (refinement <= 4 || grains.size() <= row_count) {
+        for (const Grain &grain : grains)
+            consider(candidates.fine, voxels[grain.position], decode(grain.position), grain.extent);
+    } else {
+        for (int y = first.y; y <= last.y; ++y) {
+            for (int z = first.z; z <= last.z; ++z) {
+                const int start = flat({first.x / block * block, y, z});
+                for (int base = start, x = first.x / block * block; x <= last.x; base += block, x += block) {
+                    for (unsigned bits = mobile_rows[base / block]; bits != 0; bits &= bits - 1) {
+                        const int lane = next_row_cell(bits, false);
+                        const Voxel &voxel = voxels[base + lane];
+                        if (voxel.kind == Sand) {
+                            consider(candidates.fine, voxel, {x + lane, y, z}, 1);
+                            if (candidates.fine.size() == 2 * fine_limit) trim(candidates.fine, fine_limit);
+                        }
+                    }
+                }
+            }
+        }
+    }
+    trim(candidates.fine, fine_limit);
+
+    // Packed bodies keep their separate selection rule and contribute their
+    // actual packed mass to the charge energy budget.
+    candidates.blocks.reserve(std::min(block_limit, gravel.size()));
+    for (const Grain &grain : gravel)
+        consider(candidates.blocks, voxels[grain.position], decode(grain.position), grain.extent);
+    trim(candidates.blocks, block_limit);
+    return candidates;
+}
+
 bool World::load_boxes(const int32_t *layout, size_t length) {
     if (length % 7 != 0 || (length != 0 && !layout)) return false;
     int layout_height = 0;
