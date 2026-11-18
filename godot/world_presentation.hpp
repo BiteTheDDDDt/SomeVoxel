@@ -20,6 +20,8 @@ inline Cell from_godot(godot::Vector3i v) { return {v.x, v.y, v.z}; }
 class WorldPresentation final : public World {
     using V3 = Vec3;
     using I3 = Cell;
+    uint32_t sand_visibility_tick = 0;
+    bool sand_visibility_moved = false;
 
 #ifdef SOMEVOXEL_PARALLEL_RENDER_WORKERS
     mutable std::unique_ptr<HeadWorkers> render_workers;
@@ -72,24 +74,12 @@ public:
     }
 
     void update_sand_visibility() {
-        if (visibility_revision != sand_revision) {
+        if (visibility_revision != sand_revision || (sand_visibility_moved && sand_visibility_tick != tick)) {
             visible_sand.clear();
             const auto select = [&](int start, int end, std::vector<int> &visible) {
                 for (int i = start; i < end; ++i) {
                     const Grain &g = grains[i];
-                    if (g.moved == tick && g.previous != g.position) {
-                        visible.push_back(i);
-                        continue;
-                    }
-                    const I3 p = decode(g.position);
-                    // Cull only sand fully inside other sand. Stone, gravel, and
-                    // water are deliberately ignored to keep contact surfaces visible.
-                    const int n = g.position;
-                    if (p.x == 0 || p.x == nx - 1 || p.y == 0 || p.y == ny - 1 ||
-                            p.z == 0 || p.z == nz - 1 ||
-                            voxels[n - 1].kind != Sand || voxels[n + 1].kind != Sand ||
-                            voxels[n - nx].kind != Sand || voxels[n + nx].kind != Sand ||
-                            voxels[n - slice].kind != Sand || voxels[n + slice].kind != Sand)
+                    if (grain_interpolates(g) || exposed_sand(decode(g.position), g.position))
                         visible.push_back(i);
                 }
             };
@@ -108,7 +98,19 @@ public:
 #endif
                 select(0, int(grains.size()), visible_sand);
             visibility_revision = sand_revision;
+            sand_visibility_tick = tick;
+            sand_visibility_moved = moved_grains != 0;
         }
+    }
+
+    bool grain_interpolates(const Grain &grain) const { return grain.moved == tick && grain.previous != grain.position; }
+
+    bool exposed_sand(I3 p, int i) const {
+        // Only stationary grains buried behind six sand neighbors are invisible.
+        return p.x == 0 || p.x == nx - 1 || p.y == 0 || p.y == ny - 1 || p.z == 0 || p.z == nz - 1 ||
+            voxels[i - 1].kind != Sand || voxels[i + 1].kind != Sand ||
+            voxels[i - nx].kind != Sand || voxels[i + nx].kind != Sand ||
+            voxels[i - slice].kind != Sand || voxels[i + slice].kind != Sand;
     }
 
     static V3 sand_color(float tint) {
@@ -146,6 +148,8 @@ public:
         return bits;
     }
 
+#include "detail/sand_tiles.hpp"
+
     godot::Array sand_snapshot(bool cull, int previous_rows) {
         // RGBA32F stores exact integers through 2^24. The pair of coordinates
         // per channel therefore fits for dimensions up to 4096 cells.
@@ -167,11 +171,8 @@ public:
         float *cells = data.ptrw();
         const auto write_grain = [&](float *out, const Grain &grain, int index, int style) {
             const I3 current = decode(grain.position);
-            const I3 previous = grain.moved == tick && grain.previous != grain.position ? decode(grain.previous) : current;
-            out[0] = float(current.x | (previous.x << bits.x));
-            out[1] = float(current.y | (previous.y << bits.y));
-            out[2] = float(current.z | (previous.z << bits.z));
-            out[3] = float((hash(uint32_t(index)) & 255u) | (uint32_t(style) << 8));
+            const I3 previous = grain_interpolates(grain) ? decode(grain.previous) : current;
+            write_sand_texel(out, current, previous, bits, index, style);
         };
         const auto pack_sand = [&](int start, int end) {
             for (int i = start; i < end; ++i) {
@@ -401,30 +402,61 @@ public:
     godot::Array take_water_patches() {
         godot::Array result;
         if (std::none_of(water_dirty.begin(), water_dirty.end(), [](bool dirty) { return dirty; })) return result;
-        std::array<std::vector<int>, patch_x * patch_z> bins;
-        const auto is_surface_water = [&](int i) {
-            const Voxel &cell = voxels[i];
-            return cell.kind == Water && !cell.formed;
-        };
-        for (int index : water_positions) {
+        std::array<std::vector<int>, patch_x * patch_z> moving;
+        for (const auto &entry : liquid_motion) {
+            const int index = entry.first;
             if (voxels[index].formed) continue;
-            const I3 p = decode(index);
-            const int id = patch_id(p);
-            if (!water_dirty[id]) continue;
-            // Fully submerged cells would emit no faces. Leave them out of
-            // the patch lists and keep the original order of the boundary.
-            if (p.x > 0 && p.x < nx - 1 && p.y > 0 && p.y < ny - 1 &&
-                    p.z > 0 && p.z < nz - 1 &&
-                    is_surface_water(index - 1) && is_surface_water(index + 1) &&
-                    is_surface_water(index - nx) && is_surface_water(index + nx) &&
-                    is_surface_water(index - slice) && is_surface_water(index + slice))
-                continue;
-            bins[id].push_back(index);
+            const int id = patch_id(decode(index));
+            if (water_dirty[id]) moving[id].push_back(voxels[index].occupant);
         }
+        std::vector<int> selection;
+        static_assert(patch_width % block == 0);
+        constexpr int patch_chunks = patch_width / block;
+        constexpr int plane_rows = slice / block;
         for (int id = 0; id < int(water_dirty.size()); ++id) {
             if (!water_dirty[id]) continue;
             result.push_back(id);
-            result.push_back(build_surface(Water, bins[id]));
+            if (water_positions.empty()) {
+                result.push_back(godot::Array());
+                continue;
+            }
+            selection.assign(moving[id].begin(), moving[id].end());
+            const int first_x = id % patch_x * patch_chunks;
+            const int first_z = id / patch_x * patch_chunks;
+            const int end_x = std::min(bx, first_x + patch_chunks);
+            const int end_z = std::min(bz, first_z + patch_chunks);
+            for (int cy = 0; cy < by; ++cy) {
+                for (int cz = first_z; cz < end_z; ++cz) {
+                    for (int cx = first_x; cx < end_x; ++cx) {
+                        if (!water_chunk_counts[chunk_id({cx, cy, cz})]) continue;
+                        for (int y = cy * block; y < std::min(ny, (cy + 1) * block); ++y) {
+                            for (int z = cz * block; z < (cz + 1) * block; ++z) {
+                                const int row = cx + bx * z + plane_rows * y;
+                                unsigned candidates = bulk_water_rows[row];
+                                if (!candidates) continue;
+                                if (y > 0 && y + 1 < ny && z > 0 && z + 1 < nz) {
+                                    // Six neighboring bits prove a voxel cannot have a face.
+                                    // Moving water is absent from the mask and checked by build_surface.
+                                    const unsigned left = cx > 0 ? bulk_water_rows[row - 1] : 0u;
+                                    const unsigned right = cx + 1 < bx ? bulk_water_rows[row + 1] : 0u;
+                                    const unsigned submerged = ((candidates << 1) | (left >> (block - 1))) &
+                                        ((candidates >> 1) | (right << (block - 1))) & bulk_water_rows[row - bx] &
+                                        bulk_water_rows[row + bx] & bulk_water_rows[row - plane_rows] &
+                                        bulk_water_rows[row + plane_rows];
+                                    candidates &= ~submerged;
+                                }
+                                for (int x = 0; candidates; ++x, candidates >>= 1) {
+                                    if (candidates & 1u) selection.push_back(voxels[row * block + x].occupant);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            // Keep the same face and triangle order as surface(Water).
+            std::sort(selection.begin(), selection.end());
+            for (int &index : selection) index = water_positions[index];
+            result.push_back(build_surface(Water, selection));
         }
         water_dirty.fill(false);
         return result;

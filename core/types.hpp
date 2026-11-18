@@ -7,6 +7,15 @@
 
 namespace somevoxel {
 
+struct SandSweepStats {
+    int64_t empty_rows = 0;
+    int64_t integrated = 0;
+    int64_t tested_faces = 0;
+    int64_t crossed_faces = 0;
+    int64_t contacts = 0;
+    int64_t time_us = 0;
+};
+
 struct WorldStats {
     int64_t refinement = 0;
     float cell_size = 0;

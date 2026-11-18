@@ -1,16 +1,48 @@
 #include "core/world.hpp"
 #include <iostream>
 
+static bool communicating_vessels(somevoxel::World &world) {
+    using somevoxel::World;
+    const int stone = World::Stone, water = World::Water;
+    const int32_t layout[] = {
+        0, 0, 0, 208, 4, 144, stone,
+        59, 4, 49, 60, 24, 57, stone,
+        73, 4, 49, 74, 24, 57, stone,
+        60, 4, 49, 73, 24, 50, stone,
+        60, 4, 56, 73, 24, 57, stone,
+        66, 4, 50, 67, 24, 56, stone,
+        60, 4, 50, 66, 20, 56, water,
+        // A separate reservoir keeps the fixture large enough for the
+        // packed pressure preflight and must keep its original inventory.
+        128, 4, 64, 129, 24, 129, stone,
+        193, 4, 64, 194, 24, 129, stone,
+        129, 4, 64, 193, 24, 65, stone,
+        129, 4, 128, 193, 24, 129, stone,
+        129, 4, 65, 193, 18, 128, water,
+    };
+    if (!world.load_boxes(layout, std::size(layout))) return false;
+    const auto start = world.status();
+    const auto chamber_volume = [&](int bottom) {
+        return world.range_count(water, {67, bottom, 50}, {73, 24, 56});
+    };
+    for (int i = 0; i < 16; ++i) world.step();
+    if (chamber_volume(4) != 0 || world.status().water_volume != start.water_volume) return false;
+    const float pitch = start.cell_size;
+    if (world.carve({66.f * pitch, 4.5f * pitch, 52.5f * pitch}, 0.92f * pitch) != 1) return false;
+    for (int i = 0; i < 480; ++i) world.step();
+    return chamber_volume(9) > 0 && world.status().water_volume == start.water_volume &&
+        world.range_count(water, {129, 4, 65}, {193, 24, 128}) == 64 * 14 * 63;
+}
+
 int main() {
     using somevoxel::World;
     World world;
-    const auto empty_grid = world.status().dense_grid_bytes;
     const int32_t floor[] = {0, 0, 0, 32, 1, 32, World::Stone};
     if (!world.load_boxes(floor, sizeof(floor) / sizeof(floor[0]))) return 1;
     const auto dry_grid = world.status().dense_grid_bytes;
     world.step();
     world.step();
-    if (world.status().dense_grid_bytes != dry_grid || dry_grid <= empty_grid) {
+    if (world.status().dense_grid_bytes != dry_grid) {
         std::cerr << "A dry step allocated liquid pressure storage\n";
         return 1;
     }
@@ -58,4 +90,9 @@ int main() {
         return 1;
     }
     std::cout << "Tracked packed particles transferred momentum and conserved material\n";
+    if (!communicating_vessels(world)) {
+        std::cerr << "Opening a pressure gate failed to raise the water level or changed the total volume\n";
+        return 1;
+    }
+    std::cout << "Communicating vessels conserved water and raised the receiving chamber\n";
 }

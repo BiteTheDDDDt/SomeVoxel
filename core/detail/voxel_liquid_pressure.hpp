@@ -8,11 +8,69 @@ private:
     static constexpr int pressure_transfer_limit = 48;
     static constexpr int pressure_face_budget = 2048;
     using LiquidHead = std::conditional_t<(ny <= 255), uint8_t, uint16_t>;
+
+    class LiquidHeadPages {
+        using Page = std::array<LiquidHead, block * block * block>;
+        std::vector<std::unique_ptr<Page>> pages;
+        size_t allocated = 0;
+
+        static int offset(I3 p) { return p.x % block + block * (p.z % block + block * (p.y % block)); }
+        static int page_id(I3 p) { return chunk_id({p.x / block, p.y / block, p.z / block}); }
+
+        void allocate(int id) {
+            pages[id] = std::make_unique<Page>();
+            ++allocated;
+        }
+
+    public:
+        void prepare(const std::vector<uint16_t> &wet_chunks) {
+            if (pages.empty()) pages.resize(chunk_count);
+            for (int id = 0; id < chunk_count; ++id) {
+                if (wet_chunks[id] && !pages[id]) allocate(id);
+            }
+        }
+
+        void clear() {
+            pages.clear();
+            allocated = 0;
+        }
+
+        size_t bytes() const { return pages.capacity() * sizeof(std::unique_ptr<Page>) + allocated * sizeof(Page); }
+
+        LiquidHead get(I3 p) const {
+            if (pages.empty()) return 0;
+            const auto &page = pages[page_id(p)];
+            return page ? (*page)[offset(p)] : 0;
+        }
+
+        LiquidHead get(int index) const { return get(decode(index)); }
+
+        void set(int index, LiquidHead head) {
+            const I3 p = decode(index);
+            const int id = page_id(p);
+            if (!pages[id]) allocate(id);
+            (*pages[id])[offset(p)] = head;
+        }
+
+        // Prepare all occupied pages before dispatch. Each worker owns whole
+        // Z chunk bands and publishes each occupied cell at most once.
+        bool publish(I3 p, int width, LiquidHead head) {
+            const auto first = pages[page_id(p)]->begin() + offset(p);
+            const auto last = first + width;
+            if (std::all_of(first, last, [head](LiquidHead value) { return value == head; })) return false;
+            std::fill(first, last, head);
+            return true;
+        }
+    };
+
     std::array<std::vector<int>, ny> water_by_height;
-    std::vector<LiquidHead> liquid_head;
+    LiquidHeadPages liquid_head;
     std::vector<LiquidHead> previous_water_heads;
 #ifdef SOMEVOXEL_PARALLEL_WATER_WORKERS
-    std::unique_ptr<WaterSpans<nx, ny, nz>> water_spans;
+    using PackedWaterSpans = WaterSpans<nx, ny, nz>;
+    std::unique_ptr<PackedWaterSpans> water_spans;
+    typename PackedWaterSpans::Surfaces pressure_surfaces;
+    int64_t pressure_surface_version = -1;
     int requested_water_workers = -1;
     WaterHeadAccelerator water_head_accelerator;
     int64_t accelerated_head_rebuilds = 0;
@@ -43,6 +101,42 @@ private:
         }
         return true;
     }
+
+#ifdef SOMEVOXEL_PARALLEL_WATER_WORKERS
+    bool pressure_has_outlet(const typename PackedWaterSpans::Surfaces &surfaces) const {
+        struct Levels {
+            int low = ny;
+            int high = -1;
+            bool draining = false;
+        };
+        std::unordered_map<int, Levels> levels;
+        for (const auto &band : surfaces) {
+            for (const auto &run : band) {
+                auto &component = levels[run.component];
+                if (component.draining) continue;
+                const int layer = run.cell / slice;
+                for (int bit = 0; bit < block; ++bit) {
+                    if (!(run.mask & (1u << bit))) continue;
+                    const int i = run.cell + bit;
+                    if (!passive_water(i) || voxels[i + slice].kind != Empty || body_at(i + slice)) continue;
+                    if (!supported_pressure_surface(decode(i))) {
+                        component.draining = true;
+                        break;
+                    }
+                    component.low = std::min(component.low, layer);
+                    component.high = std::max(component.high, layer);
+                }
+            }
+        }
+        // The lowest valid outlet is one layer above its support, and the
+        // original pressure solver only moves water downhill by a full cell.
+        for (const auto &entry : levels) {
+            const auto &component = entry.second;
+            if (!component.draining && component.low + 1 < component.high) return true;
+        }
+        return false;
+    }
+#endif
 
     bool pressure_route(int support, int source, int &budget) {
         pressure_outlet_route.clear();
@@ -81,7 +175,7 @@ private:
             vacancy_node = old_node;
             outlet = from;
         };
-        liquid_head[outlet] = head;
+        liquid_head.set(outlet, head);
         for (int site : pressure_outlet_route) shift(site);
         for (auto site = pressure_source_route.rbegin(); site != pressure_source_route.rend(); ++site) shift(*site);
     }
@@ -123,61 +217,75 @@ private:
 
     void refresh_liquid_head() {
         if (water_positions.empty()) return;
-        if (liquid_head.empty()) liquid_head.resize(voxels.size());
         const std::array<int64_t, 7> revisions{water_topology_version, stone_version, rock_revision, sand_revision,
             elements_version, water_form_revision, int64_t(liquid_motion.size())};
         const bool balance = tick % pressure_interval == 0 && (pressure_revision != revisions ||
             pressure_body_feet != body_feet || pressure_body_radius != body_radius || pressure_body_height != body_height);
-        if (head_version == water_topology_version && !balance) return;
+        const bool head_current = head_version == water_topology_version;
+        if (head_current && !balance) return;
+        if (!head_current) liquid_head.prepare(water_chunk_counts);
         head_version = water_topology_version;
         if (balance) {
             pressure_revision = revisions;
             pressure_body_feet = body_feet;
             pressure_body_radius = body_radius;
             pressure_body_height = body_height;
-            pressure_nodes.resize(water_positions.size());
         }
 
 #ifdef SOMEVOXEL_PARALLEL_WATER_WORKERS
-        if (!balance && water_positions.size() >= 16384) {
+        const bool use_rows = size_t(water_scan_end / block) <= 4 * water_positions.size();
+        if (water_positions.size() >= 16384 && (!balance || use_rows)) {
             if (!water_spans) {
-                water_spans = std::make_unique<WaterSpans<nx, ny, nz>>(water_worker_count());
+                water_spans = std::make_unique<PackedWaterSpans>(water_worker_count());
             }
-            const auto apply_head = [this](int i, int head) {
-                if (head == liquid_head[i]) return;
-                liquid_head[i] = LiquidHead(head);
+            const auto apply_head = [this](int i, int width, int head) {
                 const I3 p = decode(i);
-                awake[chunk_id({p.x / block, p.y / block, p.z / block})] = true;
-            };
-            if (water_head_accelerator && water_positions.size() >= 1000000) {
-                const auto start = std::chrono::steady_clock::now();
-                const bool solved = water_spans->try_accelerated_rows(bulk_water_rows, liquid_motion,
-                    water_scan_end / slice, water_head_accelerator, apply_head);
-                ++accelerator_attempts;
-                accelerator_time_us += std::chrono::duration_cast<std::chrono::microseconds>(
-                    std::chrono::steady_clock::now() - start).count();
-                if (solved) {
-                    ++accelerated_head_rebuilds;
-                    return;
+                if (liquid_head.publish(p, width, LiquidHead(head))) {
+                    awake[chunk_id({p.x / block, p.y / block, p.z / block})] = true;
                 }
+            };
+            if (balance) {
+                // If no component can make the first transfer, the snapshot
+                // will stay valid throughout this pressure update. Otherwise
+                // keep the existing traversal and parcel routing order.
+                const auto can_publish = [&](const auto &surfaces) { return !pressure_has_outlet(surfaces); };
+                if (head_current && pressure_surface_version == water_topology_version) {
+                    if (can_publish(pressure_surfaces)) return;
+                } else {
+                    pressure_surface_version = water_topology_version;
+                    if (water_spans->try_pressure_rows(bulk_water_rows, liquid_motion, water_scan_end / slice,
+                            pressure_surfaces, apply_head, can_publish)) return;
+                }
+            } else {
+                if (water_head_accelerator && water_positions.size() >= 1000000) {
+                    const auto start = std::chrono::steady_clock::now();
+                    const bool solved = water_spans->try_accelerated_rows(bulk_water_rows, liquid_motion,
+                        water_scan_end / slice, water_head_accelerator, apply_head);
+                    ++accelerator_attempts;
+                    accelerator_time_us += std::chrono::duration_cast<std::chrono::microseconds>(
+                        std::chrono::steady_clock::now() - start).count();
+                    if (solved) {
+                        ++accelerated_head_rebuilds;
+                        return;
+                    }
+                }
+                // Sparse scenes benefit from visiting just their parcel list.
+                if (use_rows) water_spans->rebuild_rows(bulk_water_rows, liquid_motion, water_scan_end / slice, apply_head);
+                else water_spans->rebuild(water_positions, apply_head);
+                return;
             }
-            // Sparse scenes still benefit from visiting just their parcel list.
-            if (size_t(water_scan_end / block) <= 4 * water_positions.size())
-                water_spans->rebuild_rows(bulk_water_rows, liquid_motion, water_scan_end / slice, apply_head);
-            else
-                water_spans->rebuild(water_positions, apply_head);
-            return;
         }
 #endif
 
+        if (balance) pressure_nodes.resize(water_positions.size());
         // Only occupied water cells participate in the wake comparison. Keep
         // the snapshot by parcel ID for the duration of this rebuild.
         previous_water_heads.resize(water_positions.size());
         for (auto &height : water_by_height) height.clear();
         for (size_t id = 0; id < water_positions.size(); ++id) {
             const int i = water_positions[id];
-            previous_water_heads[id] = liquid_head[i];
-            liquid_head[i] = 0;
+            previous_water_heads[id] = liquid_head.get(i);
+            liquid_head.set(i, 0);
             water_by_height[i / slice].push_back(i);
         }
         int transfers = pressure_transfer_limit;
@@ -185,10 +293,10 @@ private:
         for (int y = ny - 1; y >= 0; --y) {
             const LiquidHead head = y + 1;
             for (int seed : water_by_height[y]) {
-                if (liquid_head[seed] || voxels[seed].kind != Water) continue;
+                if (liquid_head.get(seed) || voxels[seed].kind != Water) continue;
                 pressure_component.clear();
                 pressure_component.push_back(seed);
-                liquid_head[seed] = head;
+                liquid_head.set(seed, head);
                 const bool record_routes = balance && transfers > 0 && faces > 0;
                 if (record_routes) pressure_nodes[voxels[seed].occupant] = {};
                 for (size_t cursor = 0; cursor < pressure_component.size(); ++cursor) {
@@ -196,8 +304,8 @@ private:
                     const I3 point = decode(source);
                     const int source_id = voxels[source].occupant;
                     const auto visit = [&](int i) {
-                        if (voxels[i].kind != Water || liquid_head[i]) return;
-                        liquid_head[i] = head;
+                        if (voxels[i].kind != Water || liquid_head.get(i)) return;
+                        liquid_head.set(i, head);
                         pressure_component.push_back(i);
                         if (record_routes) {
                             pressure_nodes[voxels[i].occupant] = {source, pressure_nodes[source_id].depth + 1};

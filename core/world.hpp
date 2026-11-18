@@ -16,6 +16,7 @@
 #include <vector>
 #include <optional>
 #include "types.hpp"
+#include "detail/paged_field.hpp"
 #if defined(SOMEVOXEL_PARALLEL_WATER_WORKERS) || defined(SOMEVOXEL_PARALLEL_RENDER_WORKERS)
 #include "detail/voxel_water_spans.hpp"
 #endif
@@ -147,7 +148,11 @@ private:
     std::vector<Voxel> voxels = std::vector<Voxel>(nx * ny * nz);
     // One bit per moving material. Each byte describes an eight-cell X row.
     std::vector<uint8_t> mobile_rows = std::vector<uint8_t>(nx * ny * nz / block);
+    // Eight adjacent X rows in Z share one summary byte at each Y layer.
+    std::vector<uint8_t> mobile_row_groups = std::vector<uint8_t>(size_t(ny) * bx * bz);
     std::vector<uint8_t> bulk_water_rows = std::vector<uint8_t>(nx * ny * nz / block);
+    // Includes moving and formed water. One count covers an 8-cubed chunk.
+    std::vector<uint16_t> water_chunk_counts = std::vector<uint16_t>(chunk_count);
     std::vector<Grain> grains;
     std::vector<Grain> gravel;
     std::unordered_map<int64_t, int> tracked_packed_particles;
@@ -174,14 +179,14 @@ private:
     int water_scan_end = 0;
 #endif
     // Current and proposed occupancy use one two-bit field per voxel.
-    std::vector<uint8_t> body_mask;
+    PagedField<uint8_t, (size_t(nx) * ny * nz + 3) / 4, true> body_mask;
     std::vector<int> body_cells;
     std::vector<int> body_next;
     V3 body_feet;
     float body_radius = 0;
     float body_height = 0;
     int water_displaced = 0;
-    std::vector<SupportStamp> support_seen;
+    PagedField<SupportStamp, size_t(nx) * ny * nz> support_seen;
     SupportStamp support_epoch = 0;
     std::array<bool, chunk_count> awake{}, next_awake{};
     std::array<bool, patch_x * patch_z> water_dirty{};
@@ -200,6 +205,8 @@ private:
     int64_t water_topology_version = 0;
     int active_count = 0;
     int moved_grains = 0;
+    bool profile_sand_sweep = false;
+    SandSweepStats sand_sweep;
     int moved_gravel = 0;
     int moved_rock = 0;
     int64_t sand_revision = 0;
@@ -224,6 +231,7 @@ private:
     }
     static V3 center(I3 p) { return (V3(p) + V3(0.5f, 0.5f, 0.5f)) * scale; }
     static int chunk_id(I3 p) { return p.x + bx * (p.z + bz * p.y); }
+    static int chunk_at(I3 p) { return chunk_id({p.x / block, p.y / block, p.z / block}); }
     static uint32_t hash(uint32_t key) {
         key ^= key >> 16;
         key *= 0x7feb352du;
@@ -266,8 +274,17 @@ private:
     bool mobile_at(int i) const { return (mobile_rows[i / block] & (1u << (i % block))) != 0; }
     void set_mobile(int i, bool mobile) {
         const auto bit = uint8_t(1u << (i % block));
-        if (mobile) mobile_rows[i / block] |= bit;
-        else mobile_rows[i / block] &= uint8_t(~bit);
+        const int row = i / block;
+        auto &cells = mobile_rows[row];
+        const bool was_empty = cells == 0;
+        if (mobile) cells |= bit;
+        else cells &= uint8_t(~bit);
+        if (was_empty == (cells == 0)) return;
+        const int line = row / bx;
+        auto &group = mobile_row_groups[line / block * bx + row % bx];
+        const auto lane = uint8_t(1u << (line % block));
+        if (was_empty) group |= lane;
+        else group &= uint8_t(~lane);
     }
 
     void sync_bulk_water(int i) {
@@ -357,6 +374,14 @@ private:
             (destination.kind == Water && !destination.formed);
         if (water_moved) {
             ++water_topology_version;
+            if (source.kind != destination.kind) {
+                const int origin = chunk_at(from), target = chunk_at(to);
+                if (origin != target) {
+                    const bool from_water = source.kind == Water;
+                    --water_chunk_counts[from_water ? origin : target];
+                    ++water_chunk_counts[from_water ? target : origin];
+                }
+            }
         }
         if (water_surface_moved) {
             ++water_version;
@@ -376,7 +401,11 @@ private:
             }
         }
         if (source.kind == Rock) record_grain_move(rock_fragments[source.occupant], b, moved_rock);
-        if (source.kind == Sand) record_grain_move(grains[source.occupant], b, moved_grains);
+        if (source.kind == Sand) {
+            record_grain_move(grains[source.occupant], b, moved_grains);
+            mark_sand_tiles(from);
+            mark_sand_tiles(to);
+        }
         const auto shift_element = [&](const Voxel &cell, int target) {
             if (!element_kind(cell.kind)) return;
             element_positions[cell.kind - Ice][cell.occupant] = target;
@@ -416,7 +445,9 @@ private:
             sync_bulk_water(a);
             sync_bulk_water(b);
         }
-        const bool wetting_moved = !water_positions.empty() && (water_moved || source.kind == Sand || destination.kind == Sand);
+        const bool wetting_moved = !water_positions.empty() && (water_moved ||
+            (source.kind == Sand && (!wet_sand.empty() || water_in_contact_chunks(from))) ||
+            (destination.kind == Sand && (!wet_sand.empty() || water_in_contact_chunks(to))));
         if (wetting_moved || track_fuel_wetting || !reaction_cells.empty()) move_element_state(a, b);
         if (source.liquid_moving || destination.liquid_moving) move_liquid_motion(a, b);
         if (source.formed || destination.formed) move_form_state(a, b);
@@ -454,12 +485,12 @@ private:
         return 0;
     }
     uint8_t body_flags(int i) const {
-        return (body_mask[i / 4] >> ((i % 4) * 2)) & 3;
+        return (body_mask.get(i / 4) >> ((i % 4) * 2)) & 3;
     }
     void set_body_flags(int i, uint8_t flags) {
         const int shift = (i % 4) * 2;
-        uint8_t &lane = body_mask[i / 4];
-        lane = uint8_t((lane & ~(3u << shift)) | (flags << shift));
+        const uint8_t lane = body_mask.get(i / 4);
+        body_mask.set(i / 4, uint8_t((lane & ~(3u << shift)) | (flags << shift)));
     }
     bool body_at(int i) const { return !body_mask.empty() && body_flags(i) != 0; }
 
@@ -469,14 +500,13 @@ private:
         dirty_surface<stone_patch_width, stone_patch_x>(p, stone_dirty);
         voxels[i] = {Rock, voxel_stamp, int(rock_fragments.size())};
         rock_fragments.push_back({i, i, tick});
-        mobile_rows[i / block] |= uint8_t(1u << (i % block));
+        set_mobile(i, true);
         wake_near(p, awake);
     }
 
     SupportStamp next_support_search(int marks = 1) {
-        if (support_seen.empty()) support_seen.resize(voxels.size(), 0);
         if (support_epoch > std::numeric_limits<SupportStamp>::max() - marks) {
-            std::fill(support_seen.begin(), support_seen.end(), 0);
+            support_seen.clear();
             support_epoch = 0;
         }
         const SupportStamp first = support_epoch + 1;
@@ -492,10 +522,10 @@ private:
         const std::array<I3, 6> directions = {{{0,-1,0}, {1,0,0}, {-1,0,0}, {0,0,1}, {0,0,-1}, {0,1,0}}};
         std::vector<int> component;
         for (int seed : seeds) {
-            if (voxels[seed].kind != Stone || support_seen[seed] == anchored) continue;
+            if (voxels[seed].kind != Stone || support_seen.get(seed) == anchored) continue;
             component.clear();
             component.push_back(seed);
-            support_seen[seed] = visited;
+            support_seen.set(seed, visited);
             bool supported = false;
             for (size_t cursor = 0; cursor < component.size() && !supported; ++cursor) {
                 const I3 p = decode(component[cursor]);
@@ -503,17 +533,17 @@ private:
                     const I3 q = p + d;
                     if (!inside(q)) continue;
                     const int i = flat(q);
-                    if (voxels[i].kind == Bedrock || (voxels[i].kind == Stone && support_seen[i] == anchored)) {
+                    if (voxels[i].kind == Bedrock || (voxels[i].kind == Stone && support_seen.get(i) == anchored)) {
                         supported = true;
                         break;
                     }
-                    if (voxels[i].kind != Stone || support_seen[i] == visited) continue;
-                    support_seen[i] = visited;
+                    if (voxels[i].kind != Stone || support_seen.get(i) == visited) continue;
+                    support_seen.set(i, visited);
                     component.push_back(i);
                 }
             }
             if (supported) {
-                for (int i : component) support_seen[i] = anchored;
+                for (int i : component) support_seen.set(i, anchored);
             } else {
                 for (int i : component) set_rock(i);
             }
@@ -525,7 +555,7 @@ private:
         std::vector<int> anchored;
         for (int i = slice; i < std::min(2 * slice, layout_end); ++i) {
             if (voxels[i].kind != Stone || voxels[i - slice].kind != Bedrock) continue;
-            support_seen[i] = visited;
+            support_seen.set(i, visited);
             anchored.push_back(i);
         }
         const std::array<I3, 6> dirs = {{{0,1,0}, {0,-1,0}, {1,0,0}, {-1,0,0}, {0,0,1}, {0,0,-1}}};
@@ -535,16 +565,17 @@ private:
                 const I3 target = p + direction;
                 if (!inside(target)) continue;
                 const int i = flat(target);
-                if (voxels[i].kind != Stone || support_seen[i] == visited) continue;
-                support_seen[i] = visited;
+                if (voxels[i].kind != Stone || support_seen.get(i) == visited) continue;
+                support_seen.set(i, visited);
                 anchored.push_back(i);
             }
         }
         for (int i = slice; i < layout_end; ++i)
-            if (voxels[i].kind == Stone && support_seen[i] != visited) set_rock(i);
+            if (voxels[i].kind == Stone && support_seen.get(i) != visited) set_rock(i);
     }
 
     void erase_sand(int id) {
+        if (!sand_tile_dirty.empty()) mark_sand_tiles(decode(grains[id].position));
         if (!airborne_earth_ejecta.empty()) airborne_earth_ejecta.erase(grains[id].position);
         if (!wet_sand.empty()) wet_sand.erase(grains[id].position);
         forget_particle_form(grains[id].position);
@@ -552,6 +583,7 @@ private:
         if (id != last) {
             grains[id] = grains[last];
             voxels[grains[id].position].occupant = id;
+            if (!sand_tile_dirty.empty()) mark_sand_tile(sand_tile_id(decode(grains[id].position)));
         }
         grains.pop_back();
     }
@@ -651,6 +683,7 @@ private:
         } else if (next == Sand) {
             voxels[i].occupant = int(grains.size());
             grains.push_back({i, i, tick});
+            mark_sand_tiles(p);
         } else if (element_kind(next)) {
             attach_element(i, next);
             if (retain_grain || handoff_motion)
@@ -661,7 +694,11 @@ private:
         if (before.kind == Sand || next == Sand) ++sand_revision;
         mark_element(before.kind);
         mark_element(next);
-        if (before.kind == Water || next == Water) ++water_topology_version;
+        if (before.kind == Water || next == Water) {
+            if (next == Water) ++water_chunk_counts[chunk_at(p)];
+            else --water_chunk_counts[chunk_at(p)];
+            ++water_topology_version;
+        }
         if (before.kind == Water || next == Water || rock_surface(before.kind) != rock_surface(next)) {
             ++water_version;
             dirty_water(p);
@@ -738,7 +775,7 @@ private:
             auto &root = vine_roots[voxels[i].occupant];
             if (root && !vine_touches_anchor(decode(i))) root = 0;
             if (!root) continue;
-            support_seen[i] = visited;
+            support_seen.set(i, visited);
             rooted.push_back(i);
         }
         for (size_t cursor = 0; cursor < rooted.size(); ++cursor) {
@@ -747,13 +784,13 @@ private:
                 const I3 q = p + d;
                 if (!inside(q)) continue;
                 const int i = flat(q);
-                if (voxels[i].kind != Vine || support_seen[i] == visited) continue;
-                support_seen[i] = visited;
+                if (voxels[i].kind != Vine || support_seen.get(i) == visited) continue;
+                support_seen.set(i, visited);
                 rooted.push_back(i);
             }
         }
         for (int i : positions) {
-            const bool detached = support_seen[i] != visited;
+            const bool detached = support_seen.get(i) != visited;
             auto &flag = detached_vines[voxels[i].occupant];
             if (detached && !flag) wake_near(decode(i), awake);
             flag = detached;
@@ -791,10 +828,10 @@ private:
         std::vector<int> connected;
         for (Kind kind : {Ice, Wood, Char}) {
             for (int seed : element_cells(kind)) {
-                if (mobile_at(seed) || support_seen[seed] == visited) continue;
+                if (mobile_at(seed) || support_seen.get(seed) == visited) continue;
                 connected.clear();
                 connected.push_back(seed);
-                support_seen[seed] = visited;
+                support_seen.set(seed, visited);
                 bool supported = false;
                 for (size_t cursor = 0; cursor < connected.size(); ++cursor) {
                     const I3 p = decode(connected[cursor]);
@@ -805,8 +842,8 @@ private:
                         const Kind neighbor = voxels[i].kind;
                         if (intact_stone(neighbor) || (d.y < 0 && (neighbor == Gravel || neighbor == Mud)))
                             supported = true;
-                        if (!structure_kind(neighbor) || mobile_at(i) || support_seen[i] == visited) continue;
-                        support_seen[i] = visited;
+                        if (!structure_kind(neighbor) || mobile_at(i) || support_seen.get(i) == visited) continue;
+                        support_seen.set(i, visited);
                         connected.push_back(i);
                     }
                 }
@@ -816,6 +853,7 @@ private:
     }
 
     void erase_gravel(int id) {
+        if (!sand_tile_dirty.empty()) mark_gravel_tile(decode(gravel[id].position));
         if (!airborne_earth_ejecta.empty()) airborne_earth_ejecta.erase(gravel[id].position);
         const int last = int(gravel.size()) - 1;
         for (auto it = tracked_packed_particles.begin(); it != tracked_packed_particles.end();) {
@@ -829,6 +867,7 @@ private:
         if (id != last) {
             gravel[id] = gravel[last];
             each_cube(gravel[id].position, gravel[id].extent, [&](int i) { voxels[i].occupant = id; });
+            if (!sand_tile_dirty.empty()) mark_gravel_tile(decode(gravel[id].position));
         }
         gravel.pop_back();
     }
@@ -879,6 +918,8 @@ private:
         if (liquid) commit_gravel_liquid_move(grain, *liquid);
         each_cube(destination, grain.extent, [&](int i) { voxels[i] = {Gravel, voxel_stamp, id}; });
         record_grain_move(grain, destination, moved_gravel);
+        mark_gravel_tile(from);
+        mark_gravel_tile(target);
         const int edge = grain.extent - 1;
         const I3 corner(edge, edge, edge);
         wake_box(from, from + corner, wake);
@@ -888,8 +929,9 @@ private:
     bool can_enter(I3 target, Kind moving, int *blocking_voxel = nullptr, bool rising_steam = false) const {
         if (!inside(target)) return false;
         const int index = flat(target);
-        if (body_at(index)) return false;
         const Voxel &candidate = voxels[index];
+        // Body occupancy can only coexist with materials it admits.
+        if (passable_body(candidate.kind) && body_at(index)) return false;
         if (candidate.kind == Empty ||
                 (candidate.stamp != voxel_stamp && (
                     ((moving == Sand || moving == Rock || moving == Mud) && candidate.kind == Water) ||
@@ -905,7 +947,7 @@ private:
         return (V3(from) + V3(half, half, half)) * scale;
     }
 
-    static GranularMaterial granular_material(Kind kind) {
+    static constexpr GranularMaterial granular_material(Kind kind) {
         if (kind == Water) return {1000.f, 0.f, 0.62f};
         if (kind == Rock) return {rock_density, 0.f, 0.82f};
         if (kind == Ice) return {917.f, 0.f, 0.96f};
@@ -931,7 +973,7 @@ private:
         return coefficients[kind];
     }
 
-    static float particle_mass(Kind kind, int extent) {
+    static constexpr float particle_mass(Kind kind, int extent) {
         const float width = extent * scale;
         return granular_material(kind).density * width * width * width;
     }
@@ -974,7 +1016,19 @@ private:
     }
 
     void resolve_granular_contact(Grain &grain, Kind kind, int axis, int direction, int blocking_voxel,
-            float kinetic_velocity, bool density_exchange = false, I3 attempted = I3()) {
+            float kinetic_velocity, bool density_exchange, I3 attempted) {
+        if (profile_sand_sweep && kind == Sand) ++sand_sweep.contacts;
+        if (kind == Sand && blocking_voxel >= 0 && voxels[blocking_voxel].kind == Sand) {
+            Grain &other = grains[voxels[blocking_voxel].occupant];
+            if ((grain.velocity[axis] - other.velocity[axis]) * direction > 0.f) {
+                // Loose sand has unit extent and carries no packed mass.
+                constexpr float mass = particle_mass(Sand, 1);
+                const float shared_speed = (grain.velocity[axis] * mass + other.velocity[axis] * mass) / (mass + mass);
+                grain.velocity[axis] = other.velocity[axis] = shared_speed;
+                next_awake[chunk_at(attempted)] = true;
+            }
+            return;
+        }
         const bool terrain_impact = !density_exchange && blocking_voxel >= 0 && kinetic_velocity * direction > 2.4f;
         const auto kinetic_projectile = [&]() {
             Grain projectile = grain;
@@ -1008,8 +1062,8 @@ private:
             / (mass + other_mass);
         grain.velocity[axis] = shared_speed;
         other->velocity[axis] = shared_speed;
-        const I3 p = decode(blocking_voxel);
-        next_awake[chunk_id({p.x / block, p.y / block, p.z / block})] = true;
+        const I3 p = kind == Gravel ? decode(blocking_voxel) : attempted;
+        next_awake[chunk_at(p)] = true;
     }
 
     struct ParticlePath {
@@ -1056,9 +1110,9 @@ private:
     }
 
     bool retains_grain_face(int obstacle) const {
-        if (obstacle < 0 || mobile_at(obstacle)) return false;
+        if (obstacle < 0) return false;
         const Kind surface = voxels[obstacle].kind;
-        return surface == Bedrock || terrain_toughness(surface) > 0.f;
+        return (surface == Bedrock || terrain_toughness(surface) > 0.f) && !mobile_at(obstacle);
     }
 
     template <typename Fits>
@@ -1104,6 +1158,8 @@ private:
             if (crossing.z < crossing[axis]) axis = 2;
             if (crossing[axis] > 1.000001f) break;
 
+            const bool profile = profile_sand_sweep && kind == Sand;
+            if (profile) ++sand_sweep.tested_faces;
             I3 next = position;
             next[axis] += direction[axis];
             int obstacle = -1;
@@ -1136,13 +1192,15 @@ private:
             } else {
                 if (kind != Gravel && kind_at(next) != Empty) {
                     const int displaced = flat(next);
-                    resolve_granular_contact(grain, kind, axis, direction[axis], displaced, grain.velocity[axis], true);
+                    resolve_granular_contact(grain, kind, axis, direction[axis], displaced, grain.velocity[axis], true, next);
                     // Commit the last empty cell first. The density exchange
                     // transfers the displaced material across this face only.
                     grain.travel = {};
                     grain.blocked_faces = 0;
+                    if (profile) ++sand_sweep.crossed_faces;
                     return {next, position};
                 }
+                if (profile) ++sand_sweep.crossed_faces;
                 position = next;
                 grain.travel[axis] -= direction[axis] * scale;
                 crossing[axis] += interval[axis];
@@ -1305,12 +1363,12 @@ private:
         return true;
     }
 
-    void update_voxel(I3 p) {
-        const int index = flat(p);
+    void update_voxel(I3 p, int index) {
         const Voxel &voxel = voxels[index];
         const Kind kind = voxel.kind;
         if (voxel.stamp == voxel_stamp || !mobile_at(index)) return;
         if (voxel.formed) {
+            if (profile_sand_sweep && kind == Sand) ++sand_sweep.integrated;
             FormMotion &form = form_motion.at(index);
             Grain &grain = kind == Water ? liquid_particle(index) : grains[voxel.occupant];
             const ParticlePath path = advance_particle(grain, p, kind, [&](I3 candidate, int *contact = nullptr) {
@@ -1322,6 +1380,7 @@ private:
         if (kind == Sand || kind == Rock) {
             Grain &grain = kind == Sand ? grains[voxel.occupant] : rock_fragments[voxel.occupant];
             if (kind == Sand && resting_sand(p, index, grain)) return;
+            if (profile_sand_sweep && kind == Sand) ++sand_sweep.integrated;
             const ParticlePath path = advance_particle(grain, p, kind, [&](I3 candidate, int *contact = nullptr) {
                 return can_enter(candidate, kind, contact);
             });
@@ -1356,7 +1415,7 @@ private:
         }
         // Pressurized water fans out sideways. A single idle surface layer can
         // settle instead of shuffling continuously across a level floor.
-        if (level != p && (kind == Water ? !liquid_head.empty() && liquid_head[index] > p.y + 1
+        if (level != p && (kind == Water ? liquid_head.get(p) > p.y + 1
                                          : kind_at(p + I3(0, 1, 0)) == Lava))
             move(p, level);
     }
@@ -1371,6 +1430,12 @@ public:
     std::optional<PackedParticleState> packed_particle_state(int64_t handle) const;
 
     void step();
+
+    void set_sand_sweep_profiling(bool enabled) {
+        profile_sand_sweep = enabled;
+        sand_sweep = {};
+    }
+    const SandSweepStats &sand_sweep_stats() const { return sand_sweep; }
 
     // -1 uses the build setting and 0 uses all available logical processors.
     void set_water_workers(int limit) {
@@ -1660,7 +1725,6 @@ public:
                 if (material == Water) displaced.push_back(i);
                 return true;
             })) return false;
-        if (body_mask.empty()) body_mask.resize((voxels.size() + 3) / 4, 0);
         constexpr uint8_t current_body = 1;
         constexpr uint8_t proposed_body = 2;
         for (int i : body_next) set_body_flags(i, body_flags(i) | proposed_body);
@@ -1896,6 +1960,7 @@ public:
             const int id = int(gravel.size());
             gravel.push_back({cell, cell, tick, extent, momentum / mass_units});
             gravel.back().sand_units = uint16_t(mass_units);
+            mark_gravel_tile(p);
             each_cube(cell, extent, [&](int i) {
                 if (voxels[i].kind == Sand) erase_sand(voxels[i].occupant);
                 voxels[i] = {Gravel, voxel_stamp, id};
@@ -2002,6 +2067,7 @@ public:
                 const auto release = [&](int i) {
                     voxels[i] = {Sand, voxel_stamp, int(grains.size())};
                     grains.push_back({i, i, tick, 1, grain.velocity});
+                    if (!sand_tile_dirty.empty()) mark_sand_tiles(decode(i));
                     queue_sand_contact(i);
                     set_mobile(i, true);
                     apply_impact_impulse(grains.back(), Sand, point, radius, strength);
@@ -2016,6 +2082,7 @@ public:
                     const int child_id = int(gravel.size());
                     gravel.push_back({child, child, tick, half, grain.velocity});
                     if (grain.sand_units) gravel.back().sand_units = uint16_t(mass_units / 8);
+                    if (!sand_tile_dirty.empty()) mark_gravel_tile(decode(child));
                     apply_impact_impulse(gravel.back(), Gravel, point, radius, strength);
                     each_cube(child, half, [&](int i) { voxels[i] = {Gravel, voxel_stamp, child_id}; });
                 }
@@ -2088,9 +2155,10 @@ public:
         data.bulk_water_hz = bulk_water_hz;
         data.voxel_bytes = sizeof(Voxel);
         data.grain_bytes = sizeof(Grain);
-        data.dense_grid_bytes = voxels.size() * sizeof(Voxel) + mobile_rows.size() + bulk_water_rows.size() +
-            (liquid_head.size() + previous_water_heads.capacity()) * sizeof(LiquidHead) +
-            body_mask.size() + support_seen.size() * sizeof(SupportStamp);
+        data.dense_grid_bytes = voxels.size() * sizeof(Voxel) + mobile_rows.size() + mobile_row_groups.size() + bulk_water_rows.size() +
+            water_chunk_counts.size() * sizeof(uint16_t) +
+            liquid_head.bytes() + previous_water_heads.capacity() * sizeof(LiquidHead) +
+            body_mask.bytes() + support_seen.bytes();
 #ifdef SOMEVOXEL_PARALLEL_WATER_WORKERS
         if (water_spans) data.dense_grid_bytes += water_spans->scratch_bytes();
 #endif
@@ -2157,6 +2225,7 @@ public:
 #include "detail/voxel_earth_wave.hpp"
 #include "detail/voxel_fire_jet.hpp"
 #include "detail/voxel_terrain_fracture.hpp"
+#include "detail/voxel_sand_tiles.hpp"
 };
 
 } // namespace somevoxel

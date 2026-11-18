@@ -14,7 +14,9 @@ In a CMake consumer, use `add_subdirectory` and link `SomeVoxel::Core`. Include 
 
 The default grid has 4.5 cm cells and runs at 120 Hz. Its dimensions and refinement are build settings. The API is experimental.
 
-Configure `SOMEVOXEL_PARALLEL_WATER_WORKERS` at build time to enable the parallel water-head solver. At runtime, `set_water_workers(n)` selects a limit per world, with 0 for all detected logical processors and −1 for the build default. `water_worker_count()` reports the configured count, including the calling thread. Ordinary water-head rebuilds use the pool. Pressure redistribution uses sequential parcel routes.
+Configure `SOMEVOXEL_PARALLEL_WATER_WORKERS` at build time to enable the parallel water-head solver. At runtime, `set_water_workers(n)` selects a limit per world, with 0 for all detected logical processors and −1 for the build default. `water_worker_count()` reports the configured count, including the calling thread. Ordinary water-head rebuilds use the pool. Pressure checks can reuse the packed component surfaces until the water topology changes. When a connected surface can discharge, the solver uses the original sequential parcel routes.
+
+Enable `set_sand_sweep_profiling(true)` to collect the latest step's row visits, loose-sand integration count, face attempts, face crossings, contact count and sweep time. Read the counters with `sand_sweep_stats()`. The Godot bridge returns the same fields as a dictionary.
 
 Alternative CPU and GPU solvers can be tested independently using the [simulation experiments](experiments/README.md).
 
@@ -43,6 +45,8 @@ assert(world.status().sand_mass == 64)
 ### Rendering sand from the CPU world
 
 `VoxelWorld.sand_snapshot(cull, previous_rows)` packs the CPU world's current and previous cell indices into an RGBA32F texture, using 16 bytes per slot. It returns the visible instance count, width, height, texture bytes, and the three bit shifts for decoding coordinates. The installed `presentation/sand_instances.gdshader` decodes the positions, interpolates in the vertex shader, and samples the colors returned by `sand_palette()`. Use an origin-aligned MultiMesh with a custom AABB that covers the world. Update the snapshot when the full `particle_motion(2)` value or visibility settings change and supply the render interpolation fraction every frame. The regular `particle_batch()` output remains available for conventional rendering.
+
+`VoxelWorld.take_sand_tiles(cull)` exposes the same texture format as stateful deltas for a single renderer. The result contains a reset flag, the coordinate shifts, the texture width, and an array of changed 64³-cell tiles. Each nonempty tile includes its ID, instance count, padded texture bytes, minimum and exclusive maximum bounds in cells, and whether its endpoints need interpolation. An empty tile returns its ID and an instance count of zero. Drop cached tiles when the reset flag is set. Use the returned bounds for each origin-aligned MultiMesh. Poll when the full motion value or culling setting changes.
 
 ### Vulkan water heads in the CPU world
 

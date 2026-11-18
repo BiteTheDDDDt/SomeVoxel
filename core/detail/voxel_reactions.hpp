@@ -159,6 +159,18 @@ private:
 
     bool has_water_contact(I3 p) const { return water_contact(p) >= 0; }
 
+    bool water_in_contact_chunks(I3 p) const {
+        const int id = chunk_at(p);
+        if (water_chunk_counts[id]) return true;
+        constexpr int edge = block - 1;
+        return ((p.x & edge) == 0 && p.x > 0 && water_chunk_counts[id - 1]) ||
+            ((p.x & edge) == edge && p.x + 1 < nx && water_chunk_counts[id + 1]) ||
+            ((p.z & edge) == 0 && p.z > 0 && water_chunk_counts[id - bx]) ||
+            ((p.z & edge) == edge && p.z + 1 < nz && water_chunk_counts[id + bx]) ||
+            ((p.y & edge) == 0 && p.y > 0 && water_chunk_counts[id - bx * bz]) ||
+            ((p.y & edge) == edge && p.y + 1 < ny && water_chunk_counts[id + bx * bz]);
+    }
+
     void queue_water_contact(int i) {
         if (voxels[i].kind != Water || (!track_fuel_wetting && grains.empty())) return;
         const I3 p = decode(i);
@@ -173,7 +185,9 @@ private:
     }
 
     void queue_sand_contact(int i) {
-        if (!water_positions.empty() && has_water_contact(decode(i))) wet_sand.try_emplace(i, 0);
+        if (water_positions.empty()) return;
+        const I3 p = decode(i);
+        if (water_in_contact_chunks(p) && has_water_contact(p)) wet_sand.try_emplace(i, 0);
     }
 
     void move_element_state(int from, int to) {

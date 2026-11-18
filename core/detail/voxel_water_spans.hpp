@@ -8,6 +8,7 @@
 #include <iterator>
 #include <mutex>
 #include <thread>
+#include <type_traits>
 #include <vector>
 
 namespace somevoxel {
@@ -95,17 +96,89 @@ template <int X, int Y, int Z> class WaterSpans {
     };
 
 public:
+    struct SurfaceRun {
+        int component;
+        int cell;
+        unsigned mask;
+    };
+    using Surfaces = std::vector<std::vector<SurfaceRun>>;
+
     explicit WaterSpans(int count) : workers(count) {}
 
     template <typename Apply> void rebuild(const std::vector<int> &water_positions, Apply apply) {
-        if (rows.empty()) rows.resize(X * Y * Z / 8);
+        if (water_positions.empty()) return;
+        const int highest = *std::max_element(water_positions.begin(), water_positions.end());
+        ensure_rows(highest / (X * Z) + 1);
         for (int i : water_positions) mark_water(i);
         propagate_heads(apply);
     }
 
     template <typename LiquidMotion, typename Apply>
     void rebuild_rows(const std::vector<uint8_t> &bulk, const LiquidMotion &moving, int height, Apply apply) {
-        if (rows.empty()) rows.resize(X * Y * Z / 8);
+        mark_rows(bulk, moving, height);
+        connect_runs();
+        publish_heads(apply);
+    }
+
+    template <typename LiquidMotion, typename Apply, typename Decide>
+    bool try_pressure_rows(const std::vector<uint8_t> &bulk, const LiquidMotion &moving, int height,
+            Surfaces &surfaces, Apply apply, Decide can_publish) {
+        mark_rows(bulk, moving, height);
+        connect_runs();
+        surfaces.resize(workers.count);
+        const auto visit_surface_runs = [&](int k, auto visit) {
+            for (int z = bands[k]; z < bands[k + 1]; ++z) {
+                for (int row_id : rows_by_z[z]) {
+                    if (row_id / slice_rows == Y - 1) continue;
+                    const Row &row = rows[row_id];
+                    const unsigned open = row.occupied & ~unsigned(rows[row_id + slice_rows].occupied);
+                    if (!open) continue;
+                    for (int id = row.begin; id < row.end(); ++id) {
+                        const Span &span = spans[id];
+                        const unsigned mask = open & (((1u << span.width) - 1u) << (span.cell % 8));
+                        if (mask) visit(id, row_id * 8, mask);
+                    }
+                }
+            }
+        };
+        std::vector<size_t> counts(workers.count);
+        workers.run([&](int k) {
+            visit_surface_runs(k, [&](int, int, unsigned) { ++counts[k]; });
+        });
+        for (int k = 0; k < workers.count; ++k) surfaces[k].resize(counts[k]);
+        workers.run([&](int k) {
+            auto output = surfaces[k].begin();
+            visit_surface_runs(k, [&](int id, int cell, unsigned mask) {
+                *output++ = {root(id), cell, mask};
+            });
+        });
+        if (can_publish(surfaces)) {
+            publish_heads(apply);
+            return true;
+        }
+        workers.run([&](int k) {
+            for (int z = bands[k]; z < bands[k + 1]; ++z) {
+                for (int row_id : rows_by_z[z]) rows[row_id].occupied = 0;
+                rows_by_z[z].clear();
+            }
+        });
+        return false;
+    }
+
+private:
+    void ensure_rows(int occupied_layers) {
+        // Joining and scanning the highest occupied layer may read an empty
+        // row immediately above it. Keep that sentinel when below the ceiling.
+        const size_t extent = size_t(std::min(Y, occupied_layers + 1)) * slice_rows;
+        if (rows.size() < extent) rows.resize(extent);
+    }
+
+    template <typename LiquidMotion>
+    void mark_rows(const std::vector<uint8_t> &bulk, const LiquidMotion &moving, int height) {
+        int occupied_layers = height;
+        for (const auto &entry : moving)
+            occupied_layers = std::max(occupied_layers, entry.first / (X * Z) + 1);
+        ensure_rows(occupied_layers);
         // Entire Z bands belong to one worker. The packed source rows are
         // already available from the simulation's live occupancy masks.
         const auto run_bands = [&](auto visit) {
@@ -148,9 +221,9 @@ public:
         // Moving parcels are absent from bulk rows but participate in the
         // same face-connected components and hydraulic heads.
         for (const auto &entry : moving) mark_water(entry.first);
-        propagate_heads(apply);
     }
 
+public:
     template <typename LiquidMotion, typename Accelerate, typename Apply>
     bool try_accelerated_rows(const std::vector<uint8_t> &bulk, const LiquidMotion &moving, int height,
             Accelerate accelerate, Apply apply) {
@@ -253,14 +326,12 @@ public:
                         const size_t row = size_t(y * depth + z - box.z0) * width + x;
                         const int cell = (source + x) * 8;
                         unsigned mask = accelerator_masks[row];
-                        bool previous_wet = false;
                         int run = 0;
-                        int head = 0;
-                        for (int offset = 0; mask != 0; ++offset, mask >>= 1) {
-                            const bool wet = (mask & 1u) != 0;
-                            if (wet && !previous_wet) head = head_at(row, run++) + box.y0;
-                            if (wet) apply(cell + offset, head);
-                            previous_wet = wet;
+                        while (mask != 0) {
+                            const int first = first_bit(mask);
+                            const int length = first_bit(~(mask >> first));
+                            apply_run(apply, cell + first, length, head_at(row, run++) + box.y0);
+                            mask &= ~(((1u << length) - 1u) << first);
                         }
                     }
                 }
@@ -283,6 +354,11 @@ private:
     }
 
     template <typename Apply> void propagate_heads(Apply apply) {
+        connect_runs();
+        publish_heads(apply);
+    }
+
+    void connect_runs() {
         std::array<int, z_blocks + 1> offsets{};
         std::array<int, z_blocks + 1> weights{};
         for (int z = 0; z < z_blocks; ++z) {
@@ -330,7 +406,9 @@ private:
             for (int row : rows_by_z[bands[k] - 1])
                 if (row / x_rows % Z == seam - 1) pair_rows(row, row + x_rows);
         }
+    }
 
+    template <typename Apply> void publish_heads(Apply apply) {
         workers.run([&](int k) {
             for (int z = bands[k]; z < bands[k + 1]; ++z) {
                 for (int row_id : rows_by_z[z]) {
@@ -338,13 +416,22 @@ private:
                     for (int id = row.begin; id < row.end(); ++id) {
                         const Span &span = spans[id];
                         const int head = spans[root(id)].head;
-                        for (int i = span.cell; i < span.cell + span.width; ++i) apply(i, head);
+                        apply_run(apply, span.cell, span.width, head);
                     }
                     row.occupied = 0;
                 }
                 rows_by_z[z].clear();
             }
         });
+    }
+
+    template <typename Apply>
+    static void apply_run(Apply &apply, int first, int width, int head) {
+        if constexpr (std::is_invocable_v<Apply, int, int, int>) {
+            apply(first, width, head);
+        } else {
+            for (int i = first; i < first + width; ++i) apply(i, head);
+        }
     }
 
     HeadWorkers workers;

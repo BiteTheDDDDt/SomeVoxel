@@ -37,6 +37,8 @@ protected:
         using godot::D_METHOD;
         ClassDB::bind_method(D_METHOD("load_boxes", "layout"), &VoxelWorld::load_boxes);
         ClassDB::bind_method(D_METHOD("step"), &VoxelWorld::step);
+        ClassDB::bind_method(D_METHOD("set_sand_sweep_profiling", "enabled"), &VoxelWorld::set_sand_sweep_profiling);
+        ClassDB::bind_method(D_METHOD("sand_sweep_stats"), &VoxelWorld::sand_sweep_stats);
         ClassDB::bind_method(D_METHOD("set_water_workers", "limit"), &VoxelWorld::set_water_workers);
         ClassDB::bind_method(D_METHOD("set_water_head_accelerator", "solve"), &VoxelWorld::set_water_head_accelerator);
         ClassDB::bind_method(D_METHOD("packed_particle_mass", "extent"), &VoxelWorld::packed_particle_mass);
@@ -91,6 +93,7 @@ protected:
         ClassDB::bind_method(D_METHOD("particle_batch", "material", "interpolation", "previous_capacity", "cull"),
             &VoxelWorld::particle_batch);
         ClassDB::bind_method(D_METHOD("sand_snapshot", "cull", "previous_rows"), &VoxelWorld::sand_snapshot);
+        ClassDB::bind_method(D_METHOD("take_sand_tiles", "cull"), &VoxelWorld::take_sand_tiles);
         ClassDB::bind_method(D_METHOD("sand_palette"), &VoxelWorld::sand_palette);
         ClassDB::bind_method(D_METHOD("range_count", "material", "minimum", "maximum"), &VoxelWorld::range_count);
         ClassDB::bind_method(D_METHOD("status"), &VoxelWorld::status);
@@ -117,6 +120,19 @@ protected:
     }
 
 public:
+    void set_sand_sweep_profiling(bool enabled) { world.set_sand_sweep_profiling(enabled); }
+
+    godot::Dictionary sand_sweep_stats() const {
+        const auto &stats = world.sand_sweep_stats();
+        godot::Dictionary result;
+        result["empty_rows"] = stats.empty_rows;
+        result["integrated"] = stats.integrated;
+        result["tested_faces"] = stats.tested_faces;
+        result["crossed_faces"] = stats.crossed_faces;
+        result["contacts"] = stats.contacts;
+        result["time_us"] = stats.time_us;
+        return result;
+    }
     void set_water_workers(int limit) { world.set_water_workers(limit); }
 
     void set_water_head_accelerator(const godot::Callable &solve) {
@@ -422,6 +438,7 @@ public:
     }
 
     godot::Array sand_snapshot(bool cull, int previous_rows) { return world.sand_snapshot(cull, previous_rows); }
+    godot::Array take_sand_tiles(bool cull) { return world.take_sand_tiles(cull); }
     godot::PackedByteArray sand_palette() const { return world.sand_palette(); }
 
     int range_count(int material, godot::Vector3i lo, godot::Vector3i hi) const {

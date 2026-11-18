@@ -33,15 +33,21 @@ bool World::load_boxes(const int32_t *layout, size_t length) {
     }
     std::fill(voxels.begin(), voxels.end(), Voxel{});
     std::fill(mobile_rows.begin(), mobile_rows.end(), 0);
+    std::fill(mobile_row_groups.begin(), mobile_row_groups.end(), 0);
     std::fill(bulk_water_rows.begin(), bulk_water_rows.end(), 0);
-    std::fill(liquid_head.begin(), liquid_head.end(), 0);
+    std::fill(water_chunk_counts.begin(), water_chunk_counts.end(), 0);
+    liquid_head.clear();
     grains.clear();
     gravel.clear();
+    reset_sand_tiles();
     tracked_packed_particles.clear();
     rock_fragments.clear();
     water_positions.clear();
 #ifdef SOMEVOXEL_PARALLEL_WATER_WORKERS
     water_scan_end = 0;
+    water_spans.reset();
+    pressure_surfaces.clear();
+    pressure_surface_version = -1;
     accelerated_head_rebuilds = 0;
     accelerator_attempts = 0;
     accelerator_time_us = 0;
@@ -58,6 +64,8 @@ bool World::load_boxes(const int32_t *layout, size_t length) {
     airborne_earth_ejecta.clear();
     pulling = false;
     remove_body();
+    support_seen.clear();
+    support_epoch = 0;
     water_displaced = 0;
     tick = voxel_stamp = 0;
     for (size_t i = 0; i < length; i += 7)
@@ -94,6 +102,7 @@ bool World::load_boxes(const int32_t *layout, size_t length) {
         if (voxels[i].kind == Water) {
             voxels[i].occupant = int(water_positions.size());
             water_positions.push_back(i);
+            ++water_chunk_counts[chunk_at(decode(i))];
             sync_bulk_water(i);
         } else if (voxels[i].kind == Sand) {
             voxels[i].occupant = int(grains.size());
@@ -153,6 +162,7 @@ int64_t World::spawn_packed_particle(Vec3 position, int extent, Vec3 impulse) {
     const int slot = int(gravel.size());
     gravel.emplace_back(index, index, tick, extent, (impulse / mass).limit_length(maximum_swept_speed),
         position - particle_center(origin, extent));
+    mark_gravel_tile(origin);
     each_cube(index, extent, [&](int i) { voxels[i] = {Gravel, voxel_stamp, slot}; });
     const int64_t handle = next_packed_handle++;
     tracked_packed_particles.emplace(handle, slot);
@@ -171,6 +181,7 @@ std::optional<PackedParticleState> World::packed_particle_state(int64_t handle) 
 }
 
 void World::step() {
+    sand_sweep = {};
     ++tick;
     // This tag only distinguishes changes within the current step. Clear
     // stale marks before reusing a tag, leaving the physics clock intact.
@@ -207,6 +218,7 @@ void World::step() {
     if (water_tick) refresh_liquid_head();
     active_count = 0;
     step_gravel();
+    const auto sweep_start = profile_sand_sweep ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
     // Reuse the horizontal worklist for all eight voxel rows of a slab.
     // The traversal within each row stays bottom-up and alternates X/Z.
     std::array<I3, bx * bz> slab_chunks;
@@ -224,10 +236,19 @@ void World::step() {
         for (int y = cy * block; y < std::min(ny, (cy + 1) * block); ++y) {
             for (int entry = 0; entry < count; ++entry) {
                 const I3 chunk = slab_chunks[entry];
+                if (!mobile_row_groups[(y * bz + chunk.z) * bx + chunk.x]) {
+                    if (profile_sand_sweep) sand_sweep.empty_rows += block;
+                    continue;
+                }
                 for (int z = 0; z < block; ++z) {
                     const I3 row(chunk.x * block, y, chunk.z * block + (reverse_z ? block - 1 - z : z));
-                    const int row_id = flat(row) / block;
+                    const int row_start = flat(row);
+                    const int row_id = row_start / block;
                     unsigned mask = mobile_rows[row_id];
+                    if (!mask) {
+                        if (profile_sand_sweep) ++sand_sweep.empty_rows;
+                        continue;
+                    }
                     if (passive_bulk_water && bulk_water_rows[row_id]) {
                         if (defer_bulk_water) {
                             // These cells can only keep this chunk scheduled
@@ -249,11 +270,15 @@ void World::step() {
                     while (mask) {
                         const int x = next_row_cell(mask, reverse_x);
                         mask &= ~(1u << x);
-                        update_voxel({row.x + x, row.y, row.z});
+                        update_voxel({row.x + x, row.y, row.z}, row_start + x);
                     }
                 }
             }
         }
+    }
+    if (profile_sand_sweep) {
+        sand_sweep.time_us = std::chrono::duration_cast<std::chrono::microseconds>(
+            std::chrono::steady_clock::now() - sweep_start).count();
     }
     awake = next_awake;
     finish_terrain_fractures();
