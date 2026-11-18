@@ -11,6 +11,8 @@ use a single directory word. Mixed pages and pages containing a dynamic
 material have storage. The probe checks material lookup against the
 original boxes. Its memory figures cover initial occupancy only.
 
+[CUDA material movement and cross-page updates](paged_material_motion.md)
+
 ## Matched sand fixture
 
 Sand starts above a floor and beside an internal wall. A local spring acceleration field pulls it toward a moving point for 0.4 seconds. The field then switches off for another 0.8 seconds. The 3 cm fixtures use the same initial grain positions across solvers. Timings are P95 per **1/60 second of simulated time**, excluding the first eight frames. CUDA timings include submission and a completion fence. Rendering, setup and validation are outside the timings. Contact order, material behavior and velocity limits differ between models.
