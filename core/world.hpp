@@ -512,10 +512,10 @@ private:
         }
     }
 
-    void settle_unanchored_layout() {
+    void settle_unanchored_layout(int layout_end) {
         const SupportStamp visited = next_support_search();
         std::vector<int> anchored;
-        for (int i = slice; i < 2 * slice; ++i) {
+        for (int i = slice; i < std::min(2 * slice, layout_end); ++i) {
             if (voxels[i].kind != Stone || voxels[i - slice].kind != Bedrock) continue;
             support_seen[i] = visited;
             anchored.push_back(i);
@@ -532,7 +532,7 @@ private:
                 anchored.push_back(i);
             }
         }
-        for (int i = slice; i < int(voxels.size()); ++i)
+        for (int i = slice; i < layout_end; ++i)
             if (voxels[i].kind == Stone && support_seen[i] != visited) set_rock(i);
     }
 

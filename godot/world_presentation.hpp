@@ -308,10 +308,24 @@ public:
         godot::Array result;
         if (std::none_of(water_dirty.begin(), water_dirty.end(), [](bool dirty) { return dirty; })) return result;
         std::array<std::vector<int>, patch_x * patch_z> bins;
+        const auto is_surface_water = [&](int i) {
+            const Voxel &cell = voxels[i];
+            return cell.kind == Water && !cell.formed;
+        };
         for (int index : water_positions) {
             if (voxels[index].formed) continue;
-            const int id = patch_id(decode(index));
-            if (water_dirty[id]) bins[id].push_back(index);
+            const I3 p = decode(index);
+            const int id = patch_id(p);
+            if (!water_dirty[id]) continue;
+            // Fully submerged cells would emit no faces. Leave them out of
+            // the patch lists and keep the original order of the boundary.
+            if (p.x > 0 && p.x < nx - 1 && p.y > 0 && p.y < ny - 1 &&
+                    p.z > 0 && p.z < nz - 1 &&
+                    is_surface_water(index - 1) && is_surface_water(index + 1) &&
+                    is_surface_water(index - nx) && is_surface_water(index + nx) &&
+                    is_surface_water(index - slice) && is_surface_water(index + slice))
+                continue;
+            bins[id].push_back(index);
         }
         for (int id = 0; id < int(water_dirty.size()); ++id) {
             if (!water_dirty[id]) continue;

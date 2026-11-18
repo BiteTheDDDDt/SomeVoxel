@@ -19,6 +19,7 @@ static int next_row_cell(unsigned row, bool descending) {
 
 bool World::load_boxes(const int32_t *layout, size_t length) {
     if (length % 7 != 0 || (length != 0 && !layout)) return false;
+    int layout_height = 0;
     for (size_t i = 0; i < length; i += 7) {
         const I3 lo(layout[i], layout[i + 1], layout[i + 2]);
         const I3 hi(layout[i + 3], layout[i + 4], layout[i + 5]);
@@ -28,6 +29,7 @@ bool World::load_boxes(const int32_t *layout, size_t length) {
                 !inside(hi - I3(1, 1, 1)) ||
                 (extent == 0 && (kind < Empty || (kind > Water && !element_kind(kind))))) return false;
         if (extent > 0 && ((lo.x | lo.y | lo.z | hi.x | hi.y | hi.z) & (extent - 1))) return false;
+        if (kind != Empty) layout_height = std::max(layout_height, hi.y);
     }
     std::fill(voxels.begin(), voxels.end(), Voxel{});
     std::fill(mobile_rows.begin(), mobile_rows.end(), 0);
@@ -57,7 +59,10 @@ bool World::load_boxes(const int32_t *layout, size_t length) {
             for (int z = layout[i + 2]; z < layout[i + 5]; ++z)
                 for (int x = layout[i]; x < layout[i + 3]; ++x)
                     voxels[flat({x, y, z})].kind = Kind(layout[i + 6]);
-    for (int i = 0; i < int(voxels.size()); ++i) {
+    // The grid was cleared before applying the boxes, so all cells above
+    // the highest authored material remain empty even on a world reload.
+    const int layout_end = layout_height * slice;
+    for (int i = 0; i < layout_end; ++i) {
         if (i < slice && voxels[i].kind == Stone) voxels[i].kind = Bedrock;
         const Kind authored = voxels[i].kind;
         const int extent = preset_extent(authored);
@@ -94,7 +99,7 @@ bool World::load_boxes(const int32_t *layout, size_t length) {
         }
         set_mobile(i, initially_mobile(voxels[i].kind));
     }
-    settle_unanchored_layout();
+    settle_unanchored_layout(layout_end);
     for (int i : element_cells(Vine))
         vine_roots[voxels[i].occupant] = vine_touches_anchor(decode(i));
     awake.fill(true);
@@ -182,7 +187,9 @@ void World::step() {
 #endif
     const bool reverse_x = (sweep_phase & 1u) != 0;
     const bool reverse_z = (sweep_phase & 2u) != 0;
-    const bool defer_bulk_water = !water_tick && !pulling_water && !winding;
+    const bool passive_bulk_water = !pulling_water && !winding;
+    const bool defer_bulk_water = !water_tick && passive_bulk_water;
+    constexpr unsigned full_row = (1u << block) - 1;
     moved_grains = 0;
     moved_gravel = 0;
     moved_rock = 0;
@@ -215,11 +222,23 @@ void World::step() {
                     const I3 row(chunk.x * block, y, chunk.z * block + (reverse_z ? block - 1 - z : z));
                     const int row_id = flat(row) / block;
                     unsigned mask = mobile_rows[row_id];
-                    if (defer_bulk_water && bulk_water_rows[row_id]) {
-                        // These cells can only keep this chunk scheduled
-                        // until the next bulk update. Moving water is still integrated.
-                        next_awake[chunk_id(chunk)] = true;
-                        mask &= ~unsigned(bulk_water_rows[row_id]);
+                    if (passive_bulk_water && bulk_water_rows[row_id]) {
+                        if (defer_bulk_water) {
+                            // These cells can only keep this chunk scheduled
+                            // until the next bulk update. Moving water is still integrated.
+                            next_awake[chunk_id(chunk)] = true;
+                            mask &= ~unsigned(bulk_water_rows[row_id]);
+                        } else if (bulk_water_rows[row_id] == full_row &&
+                                row.x > 0 && row.x + block < nx && row.z > 0 && row.z < nz - 1 && row.y > 0 &&
+                                (bulk_water_rows[row_id - 1] & (1u << (block - 1))) &&
+                                (bulk_water_rows[row_id + 1] & 1u) &&
+                                bulk_water_rows[row_id - bx] == full_row &&
+                                bulk_water_rows[row_id + bx] == full_row &&
+                                bulk_water_rows[row_id - slice / block] == full_row) {
+                            // Every possible flow face is blocked by water.
+                            // Read live rows so moves earlier in the sweep can open a face.
+                            continue;
+                        }
                     }
                     while (mask) {
                         const int x = next_row_cell(mask, reverse_x);
