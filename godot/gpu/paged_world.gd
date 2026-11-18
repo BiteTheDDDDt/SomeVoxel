@@ -4,12 +4,16 @@ extends RefCounted
 const PageLayout = preload("page_layout.gd")
 const MaterialShader = preload("material.glsl")
 const DispatchSizesShader = preload("dispatch_sizes.glsl")
+const PressureShader = preload("water_pressure.glsl")
 const GROUP_WIDTH := 128
 const MAX_BATCH := 65536
 const MAX_SURFACE_VOLUME := 2_000_000
 
 enum Kind { AIR, STONE, SAND, WATER }
-enum Buffer { DIRECTORY, ATLAS, ORIGINS, WRITABLE, SUPPORT, COUNTERS, INDIRECT, COMMANDS, TRAVEL, SWEEP_PAGES }
+enum Buffer {
+	DIRECTORY, ATLAS, ORIGINS, WRITABLE, SUPPORT, COUNTERS, INDIRECT, COMMANDS, TRAVEL, SWEEP_PAGES,
+	PRESSURE_ROWS, PRESSURE_RUNS, PRESSURE_TRANSFERS,
+}
 enum Pass {
 	SUPPORT, EXCHANGE, FRONTIER, RESERVE = 4, VALIDATE, WRITE, SAMPLE,
 	INTEGRATE, IMPULSE, SURFACE, COLUMNS, RAY, SWEEP,
@@ -22,6 +26,9 @@ var _uniforms := RID()
 var _dispatch_shader := RID()
 var _dispatch_pipeline := RID()
 var _dispatch_uniforms := RID()
+var _pressure_shader := RID()
+var _pressure_pipeline := RID()
+var _pressure_uniforms := RID()
 var _buffers: Array[RID] = []
 var _push := PackedByteArray()
 var _bounds := Vector3i.ZERO
@@ -32,6 +39,10 @@ var _motion_started := false
 var _pending := false
 var granular_sliding := false
 var ballistic_sand := true
+## Enable before loading a layout. Uses additional device memory for wet rows.
+var connected_water_pressure := false
+var _pressure_enabled := false
+var _pressure_stale := true
 var _cell_metres := 0.01
 var _seconds_per_step := 1.0 / 120.0
 
@@ -46,6 +57,8 @@ func _load_layout(layout: RefCounted, max_resident_pages: int) -> bool:
 	if capacity == 0:
 		capacity = mini(tiles, slots + maxi(32, slots >> 2))
 	if capacity < maxi(1, slots) or capacity > tiles:
+		return false
+	if connected_water_pressure and layout.bounds.x * layout.bounds.y * layout.bounds.z > 0x7ffffffe:
 		return false
 	close()
 	_rd = RenderingServer.create_local_rendering_device()
@@ -73,6 +86,22 @@ func _load_layout(layout: RefCounted, max_resident_pages: int) -> bool:
 	if not _dispatch_pipeline.is_valid():
 		close()
 		return false
+	_pressure_enabled = connected_water_pressure
+	if _pressure_enabled:
+		var pressure_spirv: RDShaderSPIRV = PressureShader.get_spirv()
+		var pressure_error := pressure_spirv.get_stage_compile_error(RenderingDevice.SHADER_STAGE_COMPUTE)
+		if not pressure_error.is_empty():
+			push_error(pressure_error)
+			close()
+			return false
+		_pressure_shader = _rd.shader_create_from_spirv(pressure_spirv)
+		if not _pressure_shader.is_valid():
+			close()
+			return false
+		_pressure_pipeline = _rd.compute_pipeline_create(_pressure_shader)
+		if not _pressure_pipeline.is_valid():
+			close()
+			return false
 	var active_count: int = layout.origins.size() >> 2
 	var initial := [
 		layout.directory.to_byte_array(), layout.atlas.to_byte_array(),
@@ -80,10 +109,13 @@ func _load_layout(layout: RefCounted, max_resident_pages: int) -> bool:
 		PackedByteArray(),
 		PackedInt32Array([slots, active_count, active_count, 0, 0, 0]).to_byte_array(),
 		PackedByteArray(), PackedByteArray(), PackedByteArray(), PackedByteArray(),
+		PackedByteArray(), PackedByteArray(), PackedByteArray(),
 	]
+	var pressure_rows := capacity * 64 if _pressure_enabled else 1
 	var sizes := [
 		tiles * 4, capacity * PageLayout.PAGE_CELLS * 4, capacity * 16, capacity * 4,
 		capacity * PageLayout.PAGE_CELLS * 4, 24, 48, MAX_BATCH * 32, capacity * PageLayout.PAGE_CELLS * 4, capacity * 4,
+		pressure_rows * 4, pressure_rows * 4 * 12 if _pressure_enabled else 4, 8 + 48 * 8 if _pressure_enabled else 4,
 	]
 	var bindings: Array[RDUniform] = []
 	for binding in sizes.size():
@@ -98,7 +130,7 @@ func _load_layout(layout: RefCounted, max_resident_pages: int) -> bool:
 			return false
 		_buffers.append(buffer)
 		_bytes += sizes[binding]
-		if binding != Buffer.INDIRECT:
+		if binding != Buffer.INDIRECT and binding <= Buffer.PRESSURE_ROWS:
 			bindings.append(_storage_uniform(binding, buffer))
 	_uniforms = _rd.uniform_set_create(bindings, _shader, 0)
 	var dispatch_bindings: Array[RDUniform] = [
@@ -109,6 +141,20 @@ func _load_layout(layout: RefCounted, max_resident_pages: int) -> bool:
 	if not _uniforms.is_valid() or not _dispatch_uniforms.is_valid():
 		close()
 		return false
+	if _pressure_enabled:
+		var pressure_bindings: Array[RDUniform] = []
+		var buffers := [
+			Buffer.DIRECTORY, Buffer.ATLAS, Buffer.ORIGINS, Buffer.WRITABLE, Buffer.SUPPORT, Buffer.COUNTERS,
+			Buffer.PRESSURE_ROWS, Buffer.PRESSURE_RUNS, Buffer.PRESSURE_TRANSFERS, Buffer.TRAVEL,
+		]
+		for binding in buffers.size():
+			pressure_bindings.append(_storage_uniform(binding, _buffers[buffers[binding]]))
+		_pressure_uniforms = _rd.uniform_set_create(pressure_bindings, _pressure_shader, 0)
+		if not _pressure_uniforms.is_valid():
+			close()
+			return false
+		_rd.buffer_clear(_buffers[Buffer.PRESSURE_ROWS], 0, sizes[Buffer.PRESSURE_ROWS])
+		_rd.buffer_clear(_buffers[Buffer.PRESSURE_TRANSFERS], 0, sizes[Buffer.PRESSURE_TRANSFERS])
 	_bounds = layout.bounds
 	_capacity = capacity
 	_rd.buffer_clear(_buffers[Buffer.SUPPORT], 0, sizes[Buffer.SUPPORT])
@@ -267,8 +313,11 @@ func submit_steps(count := 1, focus := Vector3.ZERO, radius := 0.0, expand := tr
 	_push.encode_float(72, float(kind))
 	_push.encode_float(80, 13.0 * _seconds_per_step * _seconds_per_step / _cell_metres)
 	_push.encode_float(84, _seconds_per_step)
+	_push.encode_float(96, pow(0.83, 5.4 * _seconds_per_step / _cell_metres))
+	_push.encode_float(100, 0.3 * _seconds_per_step / _cell_metres)
 	_push.encode_s32(92, int(granular_sliding))
 	var commands := _begin()
+	var pressure_interval := maxi(1, roundi(1.0 / (_seconds_per_step * 15.0)))
 	for _i in count:
 		_push.encode_u32(88, _tick + 1)
 		if expand:
@@ -276,12 +325,17 @@ func submit_steps(count := 1, focus := Vector3.ZERO, radius := 0.0, expand := tr
 			_rd.compute_list_end()
 			_publish_dispatch_sizes()
 			commands = _begin()
+		if _pressure_enabled and (_pressure_stale or (_tick + 1) % pressure_interval == 0):
+			_rd.compute_list_end()
+			_run_pressure()
+			commands = _begin()
+			_pressure_stale = false
 		if motion_mode != 0:
 			_dispatch(commands, Pass.INTEGRATE, 0, 0, 0, 0)
 		var axes := [1, 2, 0] if granular_sliding and (_tick & 1) != 0 else [1, 0, 2]
 		for axis in axes:
 			if axis != 1:
-				_dispatch(commands, Pass.SUPPORT, 0, 0, 0, 0)
+				_dispatch(commands, Pass.SUPPORT, 0, 0, int(_pressure_enabled), 0)
 			_dispatch(commands, Pass.EXCHANGE, axis, _tick & 1, 0, 12)
 			_dispatch(commands, Pass.EXCHANGE, axis, (_tick & 1) ^ 1, 0, 12)
 			if motion_mode != 0:
@@ -323,6 +377,7 @@ func set_cells(edits: PackedInt32Array) -> bool:
 	_publish_dispatch_sizes()
 	_rd.submit()
 	_rd.sync()
+	_pressure_stale = true
 	return _rd.buffer_get_data(_buffers[Buffer.COUNTERS], 16, 4).decode_s32(0) == 0
 
 ## Returns one material per (x, y, z) triplet, or -1 outside the world.
@@ -355,17 +410,24 @@ func status() -> Dictionary:
 		return {}
 	wait_for_steps()
 	var counters := _rd.buffer_get_data(_buffers[Buffer.COUNTERS]).to_int32_array()
+	var pressure_transfers := 0
+	if _pressure_enabled:
+		pressure_transfers = _rd.buffer_get_data(_buffers[Buffer.PRESSURE_TRANSFERS], 4, 4).decode_u32(0)
 	return {
 		"bounds": _bounds, "tick": _tick, "resident_pages": counters[0],
 		"active_pages": counters[2], "capacity_misses": counters[3],
 		"page_capacity": _capacity, "buffer_bytes": _bytes,
+		"pressure_transfers": pressure_transfers,
 	}
 
 func close() -> void:
 	if _rd == null:
 		return
 	wait_for_steps()
-	for resource: RID in [_uniforms, _dispatch_uniforms, _pipeline, _dispatch_pipeline, _shader, _dispatch_shader]:
+	for resource: RID in [
+		_uniforms, _dispatch_uniforms, _pressure_uniforms, _pipeline, _dispatch_pipeline, _pressure_pipeline,
+		_shader, _dispatch_shader, _pressure_shader,
+	]:
 		if resource.is_valid():
 			_rd.free_rid(resource)
 	for buffer in _buffers:
@@ -378,6 +440,9 @@ func close() -> void:
 	_dispatch_uniforms = RID()
 	_dispatch_pipeline = RID()
 	_dispatch_shader = RID()
+	_pressure_uniforms = RID()
+	_pressure_pipeline = RID()
+	_pressure_shader = RID()
 	_buffers.clear()
 	_push.clear()
 	_bounds = Vector3i.ZERO
@@ -385,12 +450,17 @@ func close() -> void:
 	_bytes = 0
 	_tick = 0
 	_motion_started = false
+	_pressure_enabled = false
+	_pressure_stale = true
 
 func _notification(what: int) -> void:
 	if what == NOTIFICATION_PREDELETE and _rd != null:
 		if _pending:
 			_rd.sync()
-		for resource: RID in [_uniforms, _dispatch_uniforms, _pipeline, _dispatch_pipeline, _shader, _dispatch_shader]:
+		for resource: RID in [
+			_uniforms, _dispatch_uniforms, _pressure_uniforms, _pipeline, _dispatch_pipeline, _pressure_pipeline,
+			_shader, _dispatch_shader, _pressure_shader,
+		]:
 			if resource.is_valid():
 				_rd.free_rid(resource)
 		for buffer in _buffers:
@@ -411,6 +481,14 @@ func _publish_dispatch_sizes() -> void:
 	_rd.compute_list_bind_compute_pipeline(commands, _dispatch_pipeline)
 	_rd.compute_list_bind_uniform_set(commands, _dispatch_uniforms, 0)
 	_rd.compute_list_dispatch(commands, 1, 1, 1)
+	_rd.compute_list_end()
+
+func _run_pressure() -> void:
+	var commands := _rd.compute_list_begin()
+	_rd.compute_list_bind_compute_pipeline(commands, _pressure_pipeline)
+	_rd.compute_list_bind_uniform_set(commands, _pressure_uniforms, 0)
+	for mode in range(6):
+		_dispatch(commands, mode, 0, 0, 0, -1 if mode == 4 else 36)
 	_rd.compute_list_end()
 
 func _begin() -> int:

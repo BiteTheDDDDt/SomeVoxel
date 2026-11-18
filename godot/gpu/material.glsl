@@ -18,6 +18,7 @@ layout(set = 0, binding = 5, std430) restrict buffer Counters {
 layout(set = 0, binding = 7, std430) restrict buffer Commands { ivec4 cells[]; };
 layout(set = 0, binding = 8, std430) restrict buffer Travel { uint travel[]; };
 layout(set = 0, binding = 9, std430) restrict buffer SweepPages { uint sweep_tick[]; };
+layout(set = 0, binding = 10, std430) readonly buffer PressureRows { uint pressure_rows[]; };
 layout(push_constant, std430) uniform Params {
     ivec4 shape_capacity;
     ivec4 bounds_mode;
@@ -70,7 +71,10 @@ void record_support(uint invocation) {
     int below = material(address(p - ivec3(0, 1, 0)));
     int above = material(address(p + ivec3(0, 1, 0)));
     int location = page.w * 512 + local;
-    flags[location] = (flags[location] & ~3u) | uint(below == 0) | (uint(above == 3) << 1);
+    bool pressurized = above == 3;
+    if (!pressurized && axis_parity_count.z != 0 && atlas[location] == 3)
+        pressurized = ((pressure_rows[location >> 3] >> (8 + (location & 7))) & 1u) != 0u;
+    flags[location] = (flags[location] & ~3u) | uint(below == 0) | (uint(pressurized) << 1);
 }
 
 int speed(uint state, int axis) {
@@ -115,13 +119,11 @@ void integrate_field(uint invocation) {
     bool affected = kind == int(field.z) && field.x > 0.0 && distance_sq < focus.w;
     bool body_contact = body.w != 0 && inside_body(p);
     bool supported = !can_enter(kind, material(address(p - ivec3(0, 1, 0))));
-    if (!affected && !body_contact && (previous >> 2) == 0u
-            && (kind == 3 || supported)) return;
+    if (!affected && !body_contact && (previous >> 2) == 0u && kind == 3) return;
     vec3 velocity = vec3(speed(previous, 0), speed(previous, 1), speed(previous, 2)) / 32.0;
     float dt = intBitsToFloat(region_origin.y);
     vec3 acceleration = vec3(0.0, -intBitsToFloat(region_origin.x), 0.0);
     float damping = kind == 3 ? (supported ? 6.5 : 1.5) : 0.0;
-    if (supported && !affected) velocity.xz *= max(0.0, 1.0 - 8.0 * dt);
     if (body_contact) acceleration += body_acceleration(p);
     if (affected) {
         float response = clamp(2.8 * (1.0 - distance_sq / focus.w), 0.0, 1.0) * field.x;
@@ -129,6 +131,32 @@ void integrate_field(uint invocation) {
         acceleration += delta * (stiffness * response * dt * dt);
         damping = (kind == 3 ? 7.0 : 13.0) * sqrt(response);
     }
+    if (supported && velocity.y <= 0.0 && acceleration.y <= 0.0) {
+        if (-velocity.y < intBitsToFloat(region_size_limit.y)) velocity.y = 0.0;
+        acceleration.y = 0.0;
+        if (kind == 2 && !affected) {
+            ivec3 slope = ivec3(0);
+            if (region_origin.w != 0) {
+                const ivec3 sides[4] = ivec3[4](ivec3(1, 0, 0), ivec3(0, 0, 1),
+                    ivec3(-1, 0, 0), ivec3(0, 0, -1));
+                uint key = uint(p.x + bounds_mode.x * (p.z + bounds_mode.z * p.y));
+                key = (key ^ (key >> 16)) * 0x7feb352du;
+                key = (key ^ (key >> 15)) * 0x846ca68bu;
+                int first = int((key ^ (key >> 16)) & 3u);
+                for (int i = 0; i < 4; i++) {
+                    ivec3 side = sides[(first + i) & 3];
+                    if (can_enter(kind, material(address(p + side))) &&
+                            can_enter(kind, material(address(p + side - ivec3(0, 1, 0))))) {
+                        slope = side;
+                        break;
+                    }
+                }
+            }
+            if (slope == ivec3(0)) velocity.xz *= intBitsToFloat(region_size_limit.x);
+            else acceleration += vec3(slope) * (1.55 * intBitsToFloat(region_origin.x));
+        }
+    }
+    if ((previous >> 2) == 0u && all(equal(acceleration, vec3(0.0)))) return;
     velocity += acceleration - velocity * (damping * dt);
     uint state = previous & 3u;
     uint displacement = 0u;
@@ -138,7 +166,8 @@ void integrate_field(uint invocation) {
         if (next == 0) continue;
         ivec3 neighbor = p;
         neighbor[axis] += sign(next);
-        if (!can_enter(kind, material(address(neighbor)))) continue;
+        int other = material(address(neighbor));
+        if (!can_enter(kind, other) && !(kind == 2 && other == 2)) continue;
         int fraction = sign(next) == sign(last) ? int(bitfieldExtract(previous_travel, axis * 10, 5)) : 0;
         fraction += abs(next);
         state = bitfieldInsert(state, uint(next), 2 + axis * 10, 10);
@@ -188,6 +217,21 @@ void extract_surface(uint invocation) {
     if (output_index < region_size_limit.w) cells[output_index] = ivec4(p, kind | (faces << 8));
 }
 
+// Equal-mass grains share only their closing normal momentum. The parcels
+// retain their tangential velocity and stay on their own side of the face.
+void close_sand_contact(int a, int b, int axis) {
+    int left = speed(flags[a], axis), right = speed(flags[b], axis);
+    if (left <= right || !((left > 0 && budget(travel[a], axis) != 0)
+            || (right < 0 && budget(travel[b], axis) != 0))) return;
+    int sum = left + right;
+    int normal_velocity = sum >> 1;
+    int shift = 2 + axis * 10;
+    flags[a] = bitfieldInsert(flags[a], uint(normal_velocity), shift, 10);
+    flags[b] = bitfieldInsert(flags[b], uint(sum - normal_velocity), shift, 10);
+    travel[a] = bitfieldInsert(travel[a], 0u, axis * 10, 10);
+    travel[b] = bitfieldInsert(travel[b], 0u, axis * 10, 10);
+}
+
 void exchange_pairs(uint invocation) {
     if (invocation >= uint(active_count) * 256u) return;
     ivec4 page = pages[invocation >> 8];
@@ -206,7 +250,10 @@ void exchange_pairs(uint invocation) {
     int b = address(q);
     if (b < 0 || writable[b / 512] == 0) return;
     int left = atlas[a], right = atlas[b];
-    if (left == right) return;
+    if (left == right) {
+        if (left == 2 && axis_parity_count.w != 0) close_sand_contact(a, b, axis);
+        return;
+    }
     if (body.w != 0) {
         bool a_inside = inside_body(p), b_inside = inside_body(q);
         // Existing grains can move out, but moving grains cannot enter.
@@ -223,8 +270,10 @@ void exchange_pairs(uint invocation) {
         swap = left == 0 && right == 3;
         if (axis_parity_count.w < 2) swap = swap || (right == 2 && (left == 0 || left == 3));
     }
-    else if (region_origin.w != 0 && left == 2 && right == 0) swap = (af & 1u) == 0u && (bf & 1u) != 0u;
-    else if (region_origin.w != 0 && right == 2 && left == 0) swap = (bf & 1u) == 0u && (af & 1u) != 0u;
+    else if (axis_parity_count.w == 0 && region_origin.w != 0 && left == 2 && right == 0)
+        swap = (af & 1u) == 0u && (bf & 1u) != 0u;
+    else if (axis_parity_count.w == 0 && region_origin.w != 0 && right == 2 && left == 0)
+        swap = (bf & 1u) == 0u && (af & 1u) != 0u;
     else if (left == 3 && right == 0) {
         swap = (af & 1u) == 0u && ((bf & 1u) != 0u || ((af & 2u) != 0u && (bf & 2u) == 0u));
     } else if (right == 3 && left == 0) {
@@ -285,7 +334,7 @@ void sweep_lines(uint invocation) {
             if (remaining == 0 || speed(flags[from], axis) * sign_ <= 0) continue;
             int kind = atlas[from];
             if (kind < 2) continue;
-            int distance = 0, to = from;
+            int distance = 0, to = from, contact = -1;
             ivec3 point = p;
             point[axis] += offset;
             bool in_body = body.w != 0 && inside_body(point);
@@ -293,7 +342,10 @@ void sweep_lines(uint invocation) {
                 int destination = offset + j * sign_;
                 if (destination < 0 || destination >= width) break;
                 int next = line_address(destination, first, second, stride);
-                if (atlas[next] != 0) break;
+                if (atlas[next] != 0) {
+                    if (kind == 2 && atlas[next] == 2) contact = next;
+                    break;
+                }
                 point[axis] += sign_;
                 if (body.w != 0) {
                     bool next_in_body = inside_body(point);
@@ -303,14 +355,19 @@ void sweep_lines(uint invocation) {
                 distance = j;
                 to = next;
             }
-            if (distance == 0) continue;
-            atlas[from] = 0;
-            atlas[to] = kind;
-            flags[to] = (flags[to] & 3u) | (flags[from] & ~3u);
-            flags[from] &= 3u;
-            travel[to] = motion - (uint(distance) << (axis * 10 + 5));
-            travel[from] = 0u;
-            if (to / 512 != from / 512 && has_whole_travel(travel[to])) mark_sweep(to / 512);
+            if (distance != 0) {
+                atlas[from] = 0;
+                atlas[to] = kind;
+                flags[to] = (flags[to] & 3u) | (flags[from] & ~3u);
+                flags[from] &= 3u;
+                travel[to] = motion - (uint(distance) << (axis * 10 + 5));
+                travel[from] = 0u;
+                if (to / 512 != from / 512 && has_whole_travel(travel[to])) mark_sweep(to / 512);
+            }
+            if (contact >= 0) {
+                if (sign_ > 0) close_sand_contact(to, contact, axis);
+                else close_sand_contact(contact, to, axis);
+            }
         }
     }
 }

@@ -128,8 +128,19 @@ func run() -> void:
 	world.step()
 	check(world.sample_cells(PackedInt32Array([7, 9, 2, 18, 9, 2, 19, 9, 2, 20, 9, 2])) == PackedInt32Array([0, 2, 1, 0]),
 		"Swept motion crosses more than one page in one step without tunnelling through the wall")
+	check(world.load_boxes(Vector3i(16, 16, 16), PackedInt32Array([
+		4, 9, 3, 6, 10, 4, World.Kind.SAND,
+	])), "Load two touching sand grains")
+	check(world.apply_impulse(Vector3(4.5, 9.5, 3.5), 0.75, Vector3(6.0, 0.0, 0.0)), "Push only the rear grain")
+	world.step(2)
+	var contact_hits := PackedInt32Array()
+	for x in range(6, 16):
+		contact_hits.append_array(PackedInt32Array([x, 9, 3]))
+	check(world.sample_cells(contact_hits).has(2) and material_counts(world, Vector3i(16, 16, 16))[2] == 2,
+		"Sand transfers contact momentum to the other grain without changing occupied mass")
 	world.close()
 	check(world.status().is_empty(), "Close releases world")
+	verify_connected_pressure()
 	if not failed:
 		print("Sparse GPU world smoke test passed.")
 	quit(int(failed))
@@ -144,6 +155,43 @@ func material_counts(world: RefCounted, bounds: Vector3i) -> PackedInt32Array:
 	for kind in world.sample_cells(points):
 		counts[kind] += 1
 	return counts
+
+func verify_connected_pressure() -> void:
+	var world := World.new()
+	world.connected_water_pressure = true
+	world.configure_motion(0.03, 1.0 / 120.0)
+	var loaded := world.load_boxes(Vector3i(64, 48, 64), PackedInt32Array([
+		0, 0, 0, 64, 2, 64, World.Kind.STONE,
+		25, 2, 24, 26, 25, 32, World.Kind.STONE,
+		39, 2, 24, 40, 25, 32, World.Kind.STONE,
+		26, 2, 24, 39, 25, 25, World.Kind.STONE,
+		26, 2, 31, 39, 25, 32, World.Kind.STONE,
+		32, 2, 25, 33, 25, 31, World.Kind.STONE,
+		26, 2, 25, 32, 18, 31, World.Kind.WATER,
+	]))
+	check(loaded, "Load communicating vessels")
+	if not loaded:
+		return
+	var left := PackedInt32Array()
+	var right := PackedInt32Array()
+	for y in range(2, 25):
+		for z in range(25, 31):
+			for x in range(26, 32):
+				left.append_array(PackedInt32Array([x, y, z]))
+			for x in range(33, 39):
+				right.append_array(PackedInt32Array([x, y, z]))
+	check(world.step(24) and world.sample_cells(left).count(World.Kind.WATER) == 576
+		and not world.sample_cells(right).has(World.Kind.WATER), "Sealed partition blocks pressure")
+	check(world.set_cells(PackedInt32Array([32, 2, 28, World.Kind.AIR])) and world.step(480),
+		"Open bottom connection and run connected pressure")
+	var low := world.sample_cells(left)
+	var high := world.sample_cells(right)
+	var gate := world.sample_cells(PackedInt32Array([32, 2, 28]))
+	check(low.count(World.Kind.WATER) + high.count(World.Kind.WATER) + gate.count(World.Kind.WATER) == 576,
+		"Connected pressure conserves the vessel mass")
+	check(absi(low.count(World.Kind.WATER) - high.count(World.Kind.WATER)) <= 16
+		and world.status().pressure_transfers > 0, "Communicating vessels fill and equalize across a page boundary")
+	world.close()
 
 func verify_fixture(fixture: String) -> void:
 	var meta: Dictionary = JSON.parse_string(FileAccess.get_file_as_string(fixture.path_join("metadata.json")))
