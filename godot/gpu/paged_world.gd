@@ -3,21 +3,25 @@ extends RefCounted
 
 const PageLayout = preload("page_layout.gd")
 const MaterialShader = preload("material.glsl")
+const DispatchSizesShader = preload("dispatch_sizes.glsl")
 const GROUP_WIDTH := 128
 const MAX_BATCH := 65536
 const MAX_SURFACE_VOLUME := 2_000_000
 
 enum Kind { AIR, STONE, SAND, WATER }
-enum Buffer { DIRECTORY, ATLAS, ORIGINS, WRITABLE, SUPPORT, COUNTERS, INDIRECT, COMMANDS }
+enum Buffer { DIRECTORY, ATLAS, ORIGINS, WRITABLE, SUPPORT, COUNTERS, INDIRECT, COMMANDS, TRAVEL, SWEEP_PAGES }
 enum Pass {
-	SUPPORT, EXCHANGE, FRONTIER, PUBLISH, RESERVE, VALIDATE, WRITE, SAMPLE,
-	INTEGRATE, IMPULSE, SURFACE, COLUMNS, RAY,
+	SUPPORT, EXCHANGE, FRONTIER, RESERVE = 4, VALIDATE, WRITE, SAMPLE,
+	INTEGRATE, IMPULSE, SURFACE, COLUMNS, RAY, SWEEP,
 }
 
 var _rd: RenderingDevice
 var _shader := RID()
 var _pipeline := RID()
 var _uniforms := RID()
+var _dispatch_shader := RID()
+var _dispatch_pipeline := RID()
+var _dispatch_uniforms := RID()
 var _buffers: Array[RID] = []
 var _push := PackedByteArray()
 var _bounds := Vector3i.ZERO
@@ -27,6 +31,9 @@ var _tick := 0
 var _motion_started := false
 var _pending := false
 var granular_sliding := false
+var ballistic_sand := true
+var _cell_metres := 0.01
+var _seconds_per_step := 1.0 / 120.0
 
 func load_boxes(bounds: Vector3i, boxes: PackedInt32Array, max_resident_pages := 0) -> bool:
 	var layout := PageLayout.new()
@@ -58,17 +65,25 @@ func _load_layout(layout: RefCounted, max_resident_pages: int) -> bool:
 	if not _pipeline.is_valid():
 		close()
 		return false
+	_dispatch_shader = _rd.shader_create_from_spirv(DispatchSizesShader.get_spirv())
+	if not _dispatch_shader.is_valid():
+		close()
+		return false
+	_dispatch_pipeline = _rd.compute_pipeline_create(_dispatch_shader)
+	if not _dispatch_pipeline.is_valid():
+		close()
+		return false
 	var active_count: int = layout.origins.size() >> 2
 	var initial := [
 		layout.directory.to_byte_array(), layout.atlas.to_byte_array(),
 		layout.origins.to_byte_array(), layout.writable.to_byte_array(),
 		PackedByteArray(),
 		PackedInt32Array([slots, active_count, active_count, 0, 0, 0]).to_byte_array(),
-		PackedByteArray(), PackedByteArray(),
+		PackedByteArray(), PackedByteArray(), PackedByteArray(), PackedByteArray(),
 	]
 	var sizes := [
 		tiles * 4, capacity * PageLayout.PAGE_CELLS * 4, capacity * 16, capacity * 4,
-		capacity * PageLayout.PAGE_CELLS * 4, 24, 36, MAX_BATCH * 16,
+		capacity * PageLayout.PAGE_CELLS * 4, 24, 48, MAX_BATCH * 32, capacity * PageLayout.PAGE_CELLS * 4, capacity * 4,
 	]
 	var bindings: Array[RDUniform] = []
 	for binding in sizes.size():
@@ -83,18 +98,22 @@ func _load_layout(layout: RefCounted, max_resident_pages: int) -> bool:
 			return false
 		_buffers.append(buffer)
 		_bytes += sizes[binding]
-		var uniform := RDUniform.new()
-		uniform.uniform_type = RenderingDevice.UNIFORM_TYPE_STORAGE_BUFFER
-		uniform.binding = binding
-		uniform.add_id(buffer)
-		bindings.append(uniform)
+		if binding != Buffer.INDIRECT:
+			bindings.append(_storage_uniform(binding, buffer))
 	_uniforms = _rd.uniform_set_create(bindings, _shader, 0)
-	if not _uniforms.is_valid():
+	var dispatch_bindings: Array[RDUniform] = [
+		_storage_uniform(0, _buffers[Buffer.COUNTERS]),
+		_storage_uniform(1, _buffers[Buffer.INDIRECT]),
+	]
+	_dispatch_uniforms = _rd.uniform_set_create(dispatch_bindings, _dispatch_shader, 0)
+	if not _uniforms.is_valid() or not _dispatch_uniforms.is_valid():
 		close()
 		return false
 	_bounds = layout.bounds
 	_capacity = capacity
 	_rd.buffer_clear(_buffers[Buffer.SUPPORT], 0, sizes[Buffer.SUPPORT])
+	_rd.buffer_clear(_buffers[Buffer.TRAVEL], 0, sizes[Buffer.TRAVEL])
+	_rd.buffer_clear(_buffers[Buffer.SWEEP_PAGES], 0, sizes[Buffer.SWEEP_PAGES])
 	_push.resize(128)
 	_push.encode_s32(0, layout.shape.x)
 	_push.encode_s32(4, layout.shape.y)
@@ -103,9 +122,19 @@ func _load_layout(layout: RefCounted, max_resident_pages: int) -> bool:
 	_push.encode_s32(16, _bounds.x)
 	_push.encode_s32(20, _bounds.y)
 	_push.encode_s32(24, _bounds.z)
-	var commands := _begin()
-	_dispatch(commands, Pass.PUBLISH)
-	_finish()
+	_publish_dispatch_sizes()
+	_rd.submit()
+	_rd.sync()
+	return true
+
+## Set the size of a cell and the duration represented by one simulation step.
+func configure_motion(cell_metres: float, seconds_per_step: float) -> bool:
+	if not is_finite(cell_metres) or cell_metres < 0.0001 or cell_metres > 100.0:
+		return false
+	if not is_finite(seconds_per_step) or seconds_per_step < 0.0001 or seconds_per_step > 0.1:
+		return false
+	_cell_metres = cell_metres
+	_seconds_per_step = seconds_per_step
 	return true
 
 ## Adds velocity in cells per step to one material inside a sphere, with linear falloff.
@@ -155,23 +184,24 @@ func surface_cells(origin: Vector3i, size: Vector3i, limit := MAX_BATCH) -> Dict
 		cells = _rd.buffer_get_data(_buffers[Buffer.COMMANDS], 0, mini(total, limit) * 16).to_int32_array()
 	return {"total": total, "cells": cells}
 
-## One RGBA32F texel per sampled column, in X/Z order. Channels are the
-## inclusive base and exclusive top of the highest sand and water runs.
-func column_map(stride: int) -> Image:
-	if _rd == null or stride <= 0:
+## Up to two RGBA32F layers stacked vertically in X/Z order. Channels are
+## the inclusive base and exclusive top of the sand and water runs.
+func column_map(stride: int, layers := 1) -> Image:
+	if _rd == null or stride <= 0 or layers < 1 or layers > 2:
 		return null
 	var width := ceili(float(_bounds.x) / stride)
 	var depth := ceili(float(_bounds.z) / stride)
-	if width * depth > MAX_BATCH or width > 16384 or depth > 16384:
+	if width * depth > MAX_BATCH or width > 16384 or depth * layers > 16384:
 		return null
 	_push.encode_s32(96, width)
 	_push.encode_s32(104, depth)
 	_push.encode_s32(108, stride)
+	_push.encode_s32(92, layers)
 	var commands := _begin()
 	_dispatch(commands, Pass.COLUMNS, 0, 0, width * depth)
 	_finish()
-	var data := _rd.buffer_get_data(_buffers[Buffer.COMMANDS], 0, width * depth * 16)
-	return Image.create_from_data(width, depth, false, Image.FORMAT_RGBAF, data)
+	var data := _rd.buffer_get_data(_buffers[Buffer.COMMANDS], 0, width * depth * layers * 16)
+	return Image.create_from_data(width, depth * layers, false, Image.FORMAT_RGBAF, data)
 
 ## Traces the authoritative GPU grid in cell coordinates. Bit 1 << Kind
 ## enables a material. The returned position is INF when the ray misses.
@@ -227,21 +257,26 @@ func submit_steps(count := 1, focus := Vector3.ZERO, radius := 0.0, expand := tr
 	if kind != Kind.SAND and kind != Kind.WATER:
 		return false
 	_motion_started = _motion_started or (radius > 0.0 and strength > 0.0)
-	_push.encode_s32(44, int(_motion_started))
+	var motion_mode := 2 if ballistic_sand else int(_motion_started)
+	_push.encode_s32(44, motion_mode)
 	_push.encode_float(48, focus.x)
 	_push.encode_float(52, focus.y)
 	_push.encode_float(56, focus.z)
 	_push.encode_float(60, radius * radius if strength > 0.0 else 0.0)
 	_push.encode_float(64, strength)
-	_push.encode_float(68, 1.0 / maxf(radius, 1e-8))
 	_push.encode_float(72, float(kind))
+	_push.encode_float(80, 13.0 * _seconds_per_step * _seconds_per_step / _cell_metres)
+	_push.encode_float(84, _seconds_per_step)
 	_push.encode_s32(92, int(granular_sliding))
 	var commands := _begin()
 	for _i in count:
+		_push.encode_u32(88, _tick + 1)
 		if expand:
 			_dispatch(commands, Pass.FRONTIER, 0, 0, 0, 24)
-			_dispatch(commands, Pass.PUBLISH)
-		if _motion_started:
+			_rd.compute_list_end()
+			_publish_dispatch_sizes()
+			commands = _begin()
+		if motion_mode != 0:
 			_dispatch(commands, Pass.INTEGRATE, 0, 0, 0, 0)
 		var axes := [1, 2, 0] if granular_sliding and (_tick & 1) != 0 else [1, 0, 2]
 		for axis in axes:
@@ -249,6 +284,9 @@ func submit_steps(count := 1, focus := Vector3.ZERO, radius := 0.0, expand := tr
 				_dispatch(commands, Pass.SUPPORT, 0, 0, 0, 0)
 			_dispatch(commands, Pass.EXCHANGE, axis, _tick & 1, 0, 12)
 			_dispatch(commands, Pass.EXCHANGE, axis, (_tick & 1) ^ 1, 0, 12)
+			if motion_mode != 0:
+				_dispatch(commands, Pass.SWEEP, axis, _tick & 1, 0, 36)
+				_dispatch(commands, Pass.SWEEP, axis, (_tick & 1) ^ 1, 0, 36)
 		_tick += 1
 	_rd.compute_list_end()
 	_rd.submit()
@@ -281,8 +319,10 @@ func set_cells(edits: PackedInt32Array) -> bool:
 	_dispatch(commands, Pass.RESERVE, 0, 0, count)
 	_dispatch(commands, Pass.VALIDATE, 0, 0, count)
 	_dispatch(commands, Pass.WRITE, 0, 0, count)
-	_dispatch(commands, Pass.PUBLISH)
-	_finish()
+	_rd.compute_list_end()
+	_publish_dispatch_sizes()
+	_rd.submit()
+	_rd.sync()
 	return _rd.buffer_get_data(_buffers[Buffer.COUNTERS], 16, 4).decode_s32(0) == 0
 
 ## Returns one material per (x, y, z) triplet, or -1 outside the world.
@@ -325,19 +365,19 @@ func close() -> void:
 	if _rd == null:
 		return
 	wait_for_steps()
-	if _uniforms.is_valid():
-		_rd.free_rid(_uniforms)
+	for resource: RID in [_uniforms, _dispatch_uniforms, _pipeline, _dispatch_pipeline, _shader, _dispatch_shader]:
+		if resource.is_valid():
+			_rd.free_rid(resource)
 	for buffer in _buffers:
 		_rd.free_rid(buffer)
-	if _pipeline.is_valid():
-		_rd.free_rid(_pipeline)
-	if _shader.is_valid():
-		_rd.free_rid(_shader)
 	_rd.free()
 	_rd = null
 	_uniforms = RID()
 	_pipeline = RID()
 	_shader = RID()
+	_dispatch_uniforms = RID()
+	_dispatch_pipeline = RID()
+	_dispatch_shader = RID()
 	_buffers.clear()
 	_push.clear()
 	_bounds = Vector3i.ZERO
@@ -350,15 +390,28 @@ func _notification(what: int) -> void:
 	if what == NOTIFICATION_PREDELETE and _rd != null:
 		if _pending:
 			_rd.sync()
-		if _uniforms.is_valid():
-			_rd.free_rid(_uniforms)
+		for resource: RID in [_uniforms, _dispatch_uniforms, _pipeline, _dispatch_pipeline, _shader, _dispatch_shader]:
+			if resource.is_valid():
+				_rd.free_rid(resource)
 		for buffer in _buffers:
 			_rd.free_rid(buffer)
-		if _pipeline.is_valid():
-			_rd.free_rid(_pipeline)
-		if _shader.is_valid():
-			_rd.free_rid(_shader)
 		_rd.free()
+
+func _storage_uniform(binding: int, buffer: RID) -> RDUniform:
+	var uniform := RDUniform.new()
+	uniform.uniform_type = RenderingDevice.UNIFORM_TYPE_STORAGE_BUFFER
+	uniform.binding = binding
+	uniform.add_id(buffer)
+	return uniform
+
+func _publish_dispatch_sizes() -> void:
+	# The publisher owns the storage write. The solver only consumes the
+	# buffer as dispatch arguments, so the render graph orders the accesses.
+	var commands := _rd.compute_list_begin()
+	_rd.compute_list_bind_compute_pipeline(commands, _dispatch_pipeline)
+	_rd.compute_list_bind_uniform_set(commands, _dispatch_uniforms, 0)
+	_rd.compute_list_dispatch(commands, 1, 1, 1)
+	_rd.compute_list_end()
 
 func _begin() -> int:
 	wait_for_steps()

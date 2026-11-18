@@ -49,7 +49,7 @@ func run() -> void:
 	check(world.load_boxes(Vector3i(24, 16, 8), PackedInt32Array([
 		8, 1, 1, 9, 2, 2, World.Kind.SAND,
 	]), 6), "Load field scenario")
-	world.step(10, Vector3(1, 6, 1), 20.0)
+	world.step(24, Vector3(3.5, 12.5, 1.5), 20.0, true, 8.0)
 	count = material_counts(world, Vector3i(24, 16, 8))
 	var in_field := PackedInt32Array()
 	for x in 8:
@@ -69,12 +69,15 @@ func run() -> void:
 	check(world.load_boxes(Vector3i(24, 16, 8), PackedInt32Array([
 		7, 1, 2, 8, 2, 3, World.Kind.SAND,
 		7, 4, 2, 8, 6, 3, World.Kind.WATER,
+		7, 9, 2, 8, 10, 3, World.Kind.SAND,
 	])), "Load impulse scenario")
-	var columns := world.column_map(1)
+	var columns := world.column_map(1, 2)
 	var spans := columns.get_pixel(7, 2)
-	check(Vector4(spans.r, spans.g, spans.b, spans.a).is_equal_approx(Vector4(1, 2, 4, 6)), "Column snapshot preserves separated materials")
+	check(Vector4(spans.r, spans.g, spans.b, spans.a).is_equal_approx(Vector4(9, 10, 4, 6)), "Column snapshot preserves the upper layer")
+	var lower := columns.get_pixel(7, 10)
+	check(lower.r == 1.0 and lower.g == 2.0, "A high grain does not hide a lower span")
 	var hit := world.ray_hit(Vector3(7.5, 20, 2.5), Vector3.DOWN, 22.0, 1 << World.Kind.SAND)
-	check(hit.is_equal_approx(Vector3(7.5, 2, 2.5)), "Ray enters the world and respects the material mask")
+	check(hit.is_equal_approx(Vector3(7.5, 10, 2.5)), "Ray enters the world and respects the material mask")
 	check(not world.ray_hit(Vector3(9, 20, 2.5), Vector3.DOWN, 22.0).is_finite(), "Empty column is a ray miss")
 	check(world.apply_impulse(Vector3(7, 1, 2), 2.0, Vector3(0.9, 0.6, 0)), "Apply regional impulse")
 	check(world.sample_cells(PackedInt32Array([7, 1, 2]))[0] == 2, "Impulse preserves position until stepping")
@@ -116,6 +119,15 @@ func run() -> void:
 		"Shallow water moves sideways without losing mass or rising above the body")
 	check(shallow.get_pixel(3, 3).g < 5.0 and final[2] == 4, "Unsupported slope edges slide without losing sand")
 	world.clear_kinematic_box()
+	check(world.load_boxes(Vector3i(32, 16, 8), PackedInt32Array([
+		7, 9, 2, 8, 10, 3, World.Kind.SAND,
+		19, 0, 0, 20, 16, 8, World.Kind.STONE,
+	])), "Load swept contact scenario")
+	check(world.set_cells(PackedInt32Array([23, 9, 2, World.Kind.AIR])), "Reserve the destination page")
+	check(world.apply_impulse(Vector3(7.5, 9.5, 2.5), 1.0, Vector3(15, 0, 0)), "Apply high-speed impulse")
+	world.step()
+	check(world.sample_cells(PackedInt32Array([7, 9, 2, 18, 9, 2, 19, 9, 2, 20, 9, 2])) == PackedInt32Array([0, 2, 1, 0]),
+		"Swept motion crosses more than one page in one step without tunnelling through the wall")
 	world.close()
 	check(world.status().is_empty(), "Close releases world")
 	if not failed:
@@ -143,6 +155,7 @@ func verify_fixture(fixture: String) -> void:
 	layout.origins = read_ints(fixture, "origins")
 	layout.writable = read_ints(fixture, "writable")
 	var world := World.new()
+	world.ballistic_sand = false
 	if not world._load_layout(layout, layout.writable.size()):
 		check(false, "Failed to load fixture.")
 		return

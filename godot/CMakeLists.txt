@@ -29,5 +29,5 @@ install(TARGETS somevoxel_godot
     LIBRARY DESTINATION addons/somevoxel/bin
 )
 install(FILES somevoxel.gdextension DESTINATION addons/somevoxel)
-install(FILES gpu/paged_world.gd gpu/page_layout.gd gpu/material.glsl DESTINATION addons/somevoxel/gpu)
+install(FILES gpu/paged_world.gd gpu/page_layout.gd gpu/material.glsl gpu/dispatch_sizes.glsl DESTINATION addons/somevoxel/gpu)
 install(FILES "${godot_cpp_SOURCE_DIR}/LICENSE.md" DESTINATION addons/somevoxel RENAME godot-cpp-LICENSE.md)

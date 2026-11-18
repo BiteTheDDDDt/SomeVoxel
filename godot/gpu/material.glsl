@@ -15,8 +15,9 @@ layout(set = 0, binding = 5, std430) restrict buffer Counters {
     int edit_failed;
     int surface_count;
 };
-layout(set = 0, binding = 6, std430) restrict buffer Indirect { uint groups[]; };
 layout(set = 0, binding = 7, std430) restrict buffer Commands { ivec4 cells[]; };
+layout(set = 0, binding = 8, std430) restrict buffer Travel { uint travel[]; };
+layout(set = 0, binding = 9, std430) restrict buffer SweepPages { uint sweep_tick[]; };
 layout(push_constant, std430) uniform Params {
     ivec4 shape_capacity;
     ivec4 bounds_mode;
@@ -27,9 +28,6 @@ layout(push_constant, std430) uniform Params {
     ivec4 region_size_limit;
     ivec4 body;
 };
-
-const uint GROUP_WIDTH = 128u;
-const uint GROUP_LIMIT = 16384u;
 
 bool inside(ivec3 p) {
     return all(greaterThanEqual(p, ivec3(0))) && all(lessThan(p, bounds_mode.xyz));
@@ -76,18 +74,32 @@ void record_support(uint invocation) {
 }
 
 int speed(uint state, int axis) {
-    return int(bitfieldExtract(state, 2 + axis * 9, 5)) - (int(bitfieldExtract(state, 6 + axis * 9, 1)) << 5);
+    return bitfieldExtract(int(state), 2 + axis * 10, 10);
 }
 
-uint ready_bit(int axis) {
-    return 1u << (29 + axis);
+int budget(uint state, int axis) {
+    return int(bitfieldExtract(state, axis * 10 + 5, 5));
+}
+
+bool has_whole_travel(uint state) {
+    const uint whole_bits = 31u << 5 | 31u << 15 | 31u << 25;
+    return (state & whole_bits) != 0u;
+}
+
+void mark_sweep(int slot) {
+    atomicMax(sweep_tick[slot], uint(region_origin.z));
 }
 
 ivec3 local_cell(int index) {
     return ivec3(index & 7, index >> 6, (index >> 3) & 7);
 }
 
-// Velocity and subcell travel are stored in sixteenths of a cell per tick.
+bool can_enter(int kind, int other) {
+    return other == 0 || (kind == 2 && other == 3);
+}
+
+// Velocity and residual travel use thirty-seconds of a cell. The force runs
+// once per fixed tick; each committed face crossing consumes one budget unit.
 void integrate_field(uint invocation) {
     if (invocation >= uint(active_count) * 512u) return;
     ivec4 page = pages[invocation >> 9];
@@ -96,37 +108,46 @@ void integrate_field(uint invocation) {
     int kind = atlas[location];
     if (kind != 2 && kind != 3) return;
     uint previous = flags[location];
+    uint previous_travel = travel[location];
     ivec3 p = page.xyz + local_cell(local);
-    vec3 delta = focus.xyz - vec3(p);
+    vec3 delta = focus.xyz - (vec3(p) + vec3(0.5));
     float distance_sq = dot(delta, delta);
     bool affected = kind == int(field.z) && field.x > 0.0 && distance_sq < focus.w;
     bool body_contact = body.w != 0 && inside_body(p);
-    if (!affected && !body_contact && (previous >> 2) == 0u) return;
-    vec3 acceleration = vec3(0.0, -0.125, 0.0);
+    bool supported = !can_enter(kind, material(address(p - ivec3(0, 1, 0))));
+    if (!affected && !body_contact && (previous >> 2) == 0u
+            && (kind == 3 || supported)) return;
+    vec3 velocity = vec3(speed(previous, 0), speed(previous, 1), speed(previous, 2)) / 32.0;
+    float dt = intBitsToFloat(region_origin.y);
+    vec3 acceleration = vec3(0.0, -intBitsToFloat(region_origin.x), 0.0);
+    float damping = kind == 3 ? (supported ? 6.5 : 1.5) : 0.0;
+    if (supported && !affected) velocity.xz *= max(0.0, 1.0 - 8.0 * dt);
     if (body_contact) acceleration += body_acceleration(p);
-    if (affected && distance_sq > 0.0) {
-        float distance = sqrt(distance_sq);
-        // Linear falloff at the field boundary and a soft center.
-        float weight = (1.0 - distance * field.y) / max(distance, 2.0);
-        acceleration += delta * (field.x * weight);
+    if (affected) {
+        float response = clamp(2.8 * (1.0 - distance_sq / focus.w), 0.0, 1.0) * field.x;
+        float stiffness = kind == 3 ? 74.0 : 94.0;
+        acceleration += delta * (stiffness * response * dt * dt);
+        damping = (kind == 3 ? 7.0 : 13.0) * sqrt(response);
     }
+    velocity += acceleration - velocity * (damping * dt);
     uint state = previous & 3u;
+    uint displacement = 0u;
     for (int axis = 0; axis < 3; axis++) {
         int last = speed(previous, axis);
-        int velocity = clamp(last - sign(last) + int(round(acceleration[axis] * 16.0)), -15, 15);
-        if (velocity == 0) continue;
+        int next = clamp(int(round(velocity[axis] * 32.0)), -511, 511);
+        if (next == 0) continue;
         ivec3 neighbor = p;
-        neighbor[axis] += sign(velocity);
-        int obstacle = material(address(neighbor));
-        if (obstacle != 0 && !(kind == 2 && obstacle == 3)) continue;
-        int shift = 2 + axis * 9;
-        int fraction = sign(velocity) == sign(last) ? int(bitfieldExtract(previous, shift + 5, 4)) : 0;
-        fraction += abs(velocity);
-        if (fraction >= 16) state |= ready_bit(axis);
-        state |= (uint(velocity) & 31u) << shift;
-        state |= (uint(fraction) & 15u) << (shift + 5);
+        neighbor[axis] += sign(next);
+        if (!can_enter(kind, material(address(neighbor)))) continue;
+        int fraction = sign(next) == sign(last) ? int(bitfieldExtract(previous_travel, axis * 10, 5)) : 0;
+        fraction += abs(next);
+        state = bitfieldInsert(state, uint(next), 2 + axis * 10, 10);
+        displacement = bitfieldInsert(displacement, uint(fraction), axis * 10, 10);
     }
     flags[location] = state;
+    travel[location] = displacement;
+    if (budget(displacement, 0) >= 2 || budget(displacement, 1) >= 2 || budget(displacement, 2) >= 2)
+        mark_sweep(page.w);
 }
 
 void add_impulse(uint invocation) {
@@ -135,17 +156,16 @@ void add_impulse(uint invocation) {
     int index = int(invocation & 511u);
     int location = page.w * 512 + index;
     if (atlas[location] != axis_parity_count.z) return;
-    vec3 delta = vec3(page.xyz + local_cell(index)) - focus.xyz;
+    vec3 delta = vec3(page.xyz + local_cell(index)) + vec3(0.5) - focus.xyz;
     float distance_sq = dot(delta, delta);
     if (distance_sq >= focus.w) return;
     float weight = 1.0 - sqrt(distance_sq) * field.w;
     uint state = flags[location];
     for (int axis = 0; axis < 3; axis++) {
         int last = speed(state, axis);
-        int velocity = clamp(last + int(round(field[axis] * weight * 16.0)), -15, 15);
-        int shift = 2 + axis * 9;
-        if (sign(velocity) != sign(last)) state = bitfieldInsert(state, 0u, shift + 5, 4);
-        state = bitfieldInsert(state, uint(velocity), shift, 5);
+        int velocity = clamp(last + int(round(field[axis] * weight * 32.0)), -511, 511);
+        if (sign(velocity) != sign(last)) travel[location] = bitfieldInsert(travel[location], 0u, axis * 10, 10);
+        state = bitfieldInsert(state, uint(velocity), 2 + axis * 10, 10);
     }
     flags[location] = state;
 }
@@ -193,13 +213,16 @@ void exchange_pairs(uint invocation) {
         if (a_inside != b_inside && (a_inside ? right != 0 : left != 0)) return;
     }
     uint af = flags[a], bf = flags[b];
-    uint ready = ready_bit(axis);
+    uint at = travel[a], bt = travel[b];
     bool swap = false;
     if (axis_parity_count.w != 0 && left >= 2 && (right == 0 || (left == 2 && right == 3)) && (af >> 2) != 0u) {
-        swap = (af & ready) != 0u && speed(af, axis) > 0;
+        swap = budget(at, axis) > 0 && speed(af, axis) > 0;
     } else if (axis_parity_count.w != 0 && right >= 2 && (left == 0 || (right == 2 && left == 3)) && (bf >> 2) != 0u) {
-        swap = (bf & ready) != 0u && speed(bf, axis) < 0;
-    } else if (axis == 1) swap = (left == 0 && (right == 2 || right == 3)) || (left == 3 && right == 2);
+        swap = budget(bt, axis) > 0 && speed(bf, axis) < 0;
+    } else if (axis == 1) {
+        swap = left == 0 && right == 3;
+        if (axis_parity_count.w < 2) swap = swap || (right == 2 && (left == 0 || left == 3));
+    }
     else if (region_origin.w != 0 && left == 2 && right == 0) swap = (af & 1u) == 0u && (bf & 1u) != 0u;
     else if (region_origin.w != 0 && right == 2 && left == 0) swap = (bf & 1u) == 0u && (af & 1u) != 0u;
     else if (left == 3 && right == 0) {
@@ -211,45 +234,122 @@ void exchange_pairs(uint invocation) {
         atlas[a] = right;
         atlas[b] = left;
         if (axis_parity_count.w != 0) {
-            flags[a] = (af & 3u) | (bf & ~(3u | ready));
-            flags[b] = (bf & 3u) | (af & ~(3u | ready));
+            uint bit = 1u << (axis * 10 + 5);
+            if (speed(bf, axis) < 0 && budget(bt, axis) > 0) bt -= bit;
+            if (speed(af, axis) > 0 && budget(at, axis) > 0) at -= bit;
+            flags[a] = (af & 3u) | (bf & ~3u);
+            flags[b] = (bf & 3u) | (af & ~3u);
+            travel[a] = bt;
+            travel[b] = at;
+            if (a / 512 != b / 512) {
+                if (has_whole_travel(bt)) mark_sweep(a / 512);
+                if (has_whole_travel(at)) mark_sweep(b / 512);
+            }
         }
     }
 }
 
-// Top contiguous run for each moving material. Uniform air and stone pages
-// need one directory lookup per eight cells.
-void column_map(uint invocation) {
-    ivec2 dimensions = region_size_limit.xz;
-    if (invocation >= uint(dimensions.x * dimensions.y)) return;
-    int stride = region_size_limit.w;
-    ivec2 column = ivec2(int(invocation) % dimensions.x, int(invocation) / dimensions.x);
-    ivec2 xz = min(column * stride + stride / 2, bounds_mode.xz - 1);
-    ivec4 spans = ivec4(0);
-    bool sand_done = false, water_done = false;
-    for (int y = bounds_mode.y - 1; y >= 0 && !(sand_done && water_done);) {
-        int slot = directory[tile_key(ivec3(xz.x, y, xz.y) / 8)];
-        int bottom = y & ~7;
-        if (slot < 0) {
-            sand_done = spans.y != 0;
-            water_done = spans.w != 0;
-            y = bottom - 1;
-            continue;
-        }
-        int local = (xz.x & 7) + 8 * (xz.y & 7);
-        for (; y >= bottom && !(sand_done && water_done); y--) {
-            int kind = atlas[slot * 512 + local + 64 * (y & 7)];
-            if (!sand_done && kind == 2) {
-                if (spans.y == 0) spans.y = y + 1;
-                spans.x = y;
-            } else if (spans.y != 0) sand_done = true;
-            if (!water_done && kind == 3) {
-                if (spans.w == 0) spans.w = y + 1;
-                spans.z = y;
-            } else if (spans.w != 0) water_done = true;
+// Each invocation owns one full line across a disjoint pair of neighboring
+// pages. A second checkerboard phase covers the intervening page boundaries.
+int line_address(int offset, int first, int second, int stride) {
+    return offset < 8 ? first + offset * stride : second + (offset - 8) * stride;
+}
+
+void sweep_lines(uint invocation) {
+    if (invocation >= uint(active_count) * 64u) return;
+    ivec4 page = pages[invocation >> 6];
+    int axis = axis_parity_count.x;
+    if (((page[axis] >> 3) & 1) != axis_parity_count.y) return;
+    int lane = int(invocation & 63u);
+    ivec3 p = page.xyz;
+    p[(axis + 1) % 3] += lane & 7;
+    p[(axis + 2) % 3] += lane >> 3;
+    if (!inside(p)) return;
+    ivec3 q = p;
+    q[axis] += 8;
+    int first = address(p);
+    int second = address(q);
+    bool paired = second >= 0 && writable[second / 512] != 0;
+    uint stamp = uint(region_origin.z);
+    if (atomicAdd(sweep_tick[page.w], 0u) != stamp
+            && (!paired || atomicAdd(sweep_tick[second / 512], 0u) != stamp)) return;
+    int width = min(bounds_mode[axis] - p[axis], paired ? 16 : 8);
+    int strides[3] = int[3](1, 64, 8);
+    int stride = strides[axis];
+    for (int sign_ = -1; sign_ <= 1; sign_ += 2) {
+        for (int index = 0; index < width; index++) {
+            int offset = sign_ > 0 ? width - 1 - index : index;
+            int from = line_address(offset, first, second, stride);
+            uint motion = travel[from];
+            int remaining = budget(motion, axis);
+            if (remaining == 0 || speed(flags[from], axis) * sign_ <= 0) continue;
+            int kind = atlas[from];
+            if (kind < 2) continue;
+            int distance = 0, to = from;
+            ivec3 point = p;
+            point[axis] += offset;
+            bool in_body = body.w != 0 && inside_body(point);
+            for (int j = 1; j <= remaining; j++) {
+                int destination = offset + j * sign_;
+                if (destination < 0 || destination >= width) break;
+                int next = line_address(destination, first, second, stride);
+                if (atlas[next] != 0) break;
+                point[axis] += sign_;
+                if (body.w != 0) {
+                    bool next_in_body = inside_body(point);
+                    if (!in_body && next_in_body) break;
+                    in_body = next_in_body;
+                }
+                distance = j;
+                to = next;
+            }
+            if (distance == 0) continue;
+            atlas[from] = 0;
+            atlas[to] = kind;
+            flags[to] = (flags[to] & 3u) | (flags[from] & ~3u);
+            flags[from] &= 3u;
+            travel[to] = motion - (uint(distance) << (axis * 10 + 5));
+            travel[from] = 0u;
+            if (to / 512 != from / 512 && has_whole_travel(travel[to])) mark_sweep(to / 512);
         }
     }
-    cells[invocation] = ivec4(floatBitsToInt(vec4(spans)));
+}
+
+// Record the highest contiguous runs without filling the gaps between them.
+// Uniform air and stone pages need one directory lookup per eight cells.
+void column_map(uint invocation) {
+    ivec2 dimensions = region_size_limit.xz;
+    uint count = uint(dimensions.x * dimensions.y);
+    if (invocation >= count) return;
+    int stride = region_size_limit.w;
+    int layers = region_origin.w;
+    ivec2 column = ivec2(int(invocation) % dimensions.x, int(invocation) / dimensions.x);
+    ivec2 xz = min(column * stride + stride / 2, bounds_mode.xz - 1);
+    ivec4 spans[2] = ivec4[2](ivec4(0), ivec4(0));
+    ivec2 completed = ivec2(0);
+    for (int y = bounds_mode.y - 1; y >= 0 && any(lessThan(completed, ivec2(layers)));) {
+        int slot = directory[tile_key(ivec3(xz.x, y, xz.y) / 8)];
+        int bottom = y & ~7;
+        int local = (xz.x & 7) + 8 * (xz.y & 7);
+        do {
+            int kind = slot < 0 ? 0 : atlas[slot * 512 + local + 64 * (y & 7)];
+            for (int material_index = 0; material_index < 2; material_index++) {
+                int layer = completed[material_index];
+                if (layer == layers) continue;
+                int channel = material_index * 2;
+                if (kind == material_index + 2) {
+                    if (spans[layer][channel + 1] == 0) spans[layer][channel + 1] = y + 1;
+                    spans[layer][channel] = y;
+                } else if (spans[layer][channel + 1] != 0) {
+                    completed[material_index]++;
+                }
+            }
+            y--;
+        } while (slot >= 0 && y >= bottom && any(lessThan(completed, ivec2(layers))));
+        y = bottom - 1;
+    }
+    for (int layer = 0; layer < layers; layer++)
+        cells[invocation + uint(layer) * count] = floatBitsToInt(vec4(spans[layer]));
 }
 
 void trace_ray() {
@@ -315,8 +415,10 @@ void ensure_page(ivec3 origin, bool allow_stone) {
         for (int i = 0; i < 512; i++) {
             atlas[next * 512 + i] = kind;
             flags[next * 512 + i] = 0u;
+            travel[next * 512 + i] = 0u;
         }
         atomicExchange(writable[next], 1);
+        sweep_tick[next] = 0u;
         pages[atomicAdd(pending_active, 1)] = ivec4(origin, next);
         atomicExchange(directory[key], next);
     } else if (atomicCompSwap(writable[slot], 0, 1) == 0) {
@@ -338,8 +440,8 @@ void expand_frontier(uint invocation) {
     int u_axis = (axis + 1) % 3;
     int v_axis = (axis + 2) % 3;
     ivec3 local = ivec3(0);
-    // Two exchanges per axis can move material by two cells in one update.
-    for (int depth = 0; depth < 2; depth++) {
+    int scan_depth = axis_parity_count.w == 0 ? 2 : 8;
+    for (int depth = 0; depth < scan_depth; depth++) {
         local[axis] = side == 0 ? depth : 7 - depth;
         for (int v = 0; v < 8; v++) {
             local[v_axis] = v;
@@ -355,32 +457,18 @@ void expand_frontier(uint invocation) {
     }
 }
 
-void dispatch_size(uint offset, uint invocations) {
-    uint total = max(1u, (invocations + GROUP_WIDTH - 1u) / GROUP_WIDTH);
-    groups[offset] = min(total, GROUP_LIMIT);
-    groups[offset + 1u] = (total + GROUP_LIMIT - 1u) / GROUP_LIMIT;
-    groups[offset + 2u] = 1u;
-}
-
-void publish_dispatch_sizes() {
-    active_count = pending_active;
-    dispatch_size(0u, uint(active_count) * 512u);
-    dispatch_size(3u, uint(active_count) * 256u);
-    dispatch_size(6u, uint(active_count) * 6u);
-}
-
 void main() {
-    uint invocation = gl_GlobalInvocationID.x + gl_GlobalInvocationID.y * GROUP_LIMIT * GROUP_WIDTH;
+    uint invocation = gl_GlobalInvocationID.x + gl_GlobalInvocationID.y * 16384u * gl_WorkGroupSize.x;
     int mode = bounds_mode.w;
     if (mode == 0) record_support(invocation);
     else if (mode == 1) exchange_pairs(invocation);
     else if (mode == 2) expand_frontier(invocation);
-    else if (mode == 3 && invocation == 0u) publish_dispatch_sizes();
     else if (mode == 8) integrate_field(invocation);
     else if (mode == 9) add_impulse(invocation);
     else if (mode == 10) extract_surface(invocation);
     else if (mode == 11) column_map(invocation);
     else if (mode == 12 && invocation == 0u) trace_ray();
+    else if (mode == 13) sweep_lines(invocation);
     else if (mode >= 4 && invocation < uint(axis_parity_count.z)) {
         ivec3 p = cells[invocation].xyz;
         if (mode == 4) ensure_page(p & ~7, true);
@@ -389,6 +477,7 @@ void main() {
             int location = address(p);
             atlas[location] = cells[invocation].w;
             flags[location] = 0u;
+            travel[location] = 0u;
         }
         else if (mode == 7) {
             cells[invocation].w = inside(p) ? material(address(p)) : -1;
