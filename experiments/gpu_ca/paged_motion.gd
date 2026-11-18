@@ -33,6 +33,7 @@ func run() -> void:
 	var shape: Array = metadata.shape
 	var focus: Array = metadata.focus
 	var updates: int = metadata.updates
+	var field_radius: float = metadata.get("field_radius", 85.0)
 	page_count = metadata.page_count
 	rd = RenderingServer.create_local_rendering_device()
 	if rd == null:
@@ -82,7 +83,7 @@ func run() -> void:
 		push.encode_float(32, float(focus[0]) + 0.75 * mini(tick, updates >> 1))
 		push.encode_float(36, focus[1])
 		push.encode_float(40, float(focus[2]) + 0.25 * tick)
-		push.encode_float(44, 7225.0 if tick < floori(2.0 * updates / 3.0) else 0.0)
+		push.encode_float(44, field_radius * field_radius if tick < floori(2.0 * updates / 3.0) else 0.0)
 		var start := Time.get_ticks_usec()
 		var commands := rd.compute_list_begin()
 		rd.compute_list_bind_compute_pipeline(commands, pipeline)
