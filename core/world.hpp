@@ -1645,7 +1645,12 @@ public:
                 frontier.emplace(0, source);
             }
             int visited = 0;
-            while (!frontier.empty() && unfilled > 0 && visited < 24000) {
+            // A finer body voxelization can supply more source cells than
+            // the entire search budget of the standard resolutions.
+            constexpr int reference_search_budget = 24000;
+            const size_t search_budget = refinement > 8 ?
+                std::max<size_t>(reference_search_budget, displaced.size() * 12) : reference_search_budget;
+            while (!frontier.empty() && unfilled > 0 && size_t(visited) < search_budget) {
                 const auto [cost, i] = frontier.top();
                 frontier.pop();
                 const auto [best_cost, component] = routes.at(i);
