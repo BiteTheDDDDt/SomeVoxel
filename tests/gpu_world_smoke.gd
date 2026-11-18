@@ -141,9 +141,57 @@ func run() -> void:
 	world.close()
 	check(world.status().is_empty(), "Close releases world")
 	verify_connected_pressure()
+	verify_growth_and_sweep()
 	if not failed:
 		print("Sparse GPU world smoke test passed.")
 	quit(int(failed))
+
+# Compare exact material trajectories across scheduler and pool configurations.
+func verify_growth_and_sweep() -> void:
+	var bounds := Vector3i(56, 24, 24)
+	var boxes := PackedInt32Array([7, 15, 7, 8, 16, 8, World.Kind.SAND])
+	var points := PackedInt32Array()
+	for y in bounds.y:
+		for z in bounds.z:
+			for x in bounds.x:
+				points.append_array(PackedInt32Array([x, y, z]))
+	var reference: Array[PackedInt32Array] = []
+	for option in 3:
+		var world := World.new()
+		world.connected_water_pressure = true
+		world.grow_page_pool = option == 2
+		world.compact_sweep = option != 0
+		var capacity := 1 if world.grow_page_pool else 63
+		var loaded := world.load_boxes(bounds, boxes, capacity)
+		check(loaded, "Load each pool and sweep configuration")
+		if not loaded:
+			return
+		check(world.apply_impulse(Vector3(7.5, 15.5, 7.5), 0.75, Vector3(13, 0, -4)), "Apply fast boundary impulse")
+		check(world.step(1, Vector3.ZERO, 0.0, false), "A step without frontier expansion keeps the pool fixed")
+		check(world.status().page_capacity == capacity, "Disabled frontier does not grow the pool")
+		for sample in 3:
+			check(world.submit_steps(8), "Submit a batch that may grow the pool")
+			# This changes the next batch while the current submission is pending.
+			check(world.set_kinematic_box(Vector3i(18 + sample, 2, 7), 2, 6), "Set next batch's obstacle")
+			var materials := world.sample_cells(points)
+			if option == 0:
+				reference.append(materials)
+			else:
+				check(reference[sample] == materials, "Exact cell trajectory with compact sweep and pool growth")
+		var stats := world.status()
+		check(stats.tick == 25 and stats.capacity_misses == 0, "Every submitted tick completed without rejected pages")
+		if world.compact_sweep:
+			check(stats.sweep_pairs < stats.sweep_full_pairs, "Compact sweep reduces submitted page pairs")
+		if world.grow_page_pool:
+			check(stats.page_growths >= 2 and stats.page_capacity >= stats.resident_pages, "Replay supports multiple pool growths")
+		world.close()
+	var edits := World.new()
+	edits.grow_page_pool = true
+	check(edits.load_boxes(Vector3i(24, 8, 8), PackedInt32Array(), 1), "Load an empty pool for edit growth")
+	check(edits.set_cells(PackedInt32Array([1, 1, 1, 1, 9, 1, 1, 2, 17, 1, 1, 3])), "A single edit batch grows across three pages")
+	check(edits.sample_cells(PackedInt32Array([1, 1, 1, 9, 1, 1, 17, 1, 1])) == PackedInt32Array([1, 2, 3]), "All edits committed after growth")
+	check(edits.status().page_growths == 2 and edits.status().capacity_misses == 0, "Edit growth statistics")
+	edits.close()
 
 func material_counts(world: RefCounted, bounds: Vector3i) -> PackedInt32Array:
 	var points := PackedInt32Array()

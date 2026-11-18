@@ -14,11 +14,17 @@ layout(set = 0, binding = 5, std430) restrict buffer Counters {
     int capacity_misses;
     int edit_failed;
     int surface_count;
+    int blocked;
+    uint completed_tick;
+    uint sweep_pending;
+    uint sweep_count;
+    uint sweep_pairs;
 };
 layout(set = 0, binding = 7, std430) restrict buffer Commands { ivec4 cells[]; };
 layout(set = 0, binding = 8, std430) restrict buffer Travel { uint travel[]; };
 layout(set = 0, binding = 9, std430) restrict buffer SweepPages { uint sweep_tick[]; };
 layout(set = 0, binding = 10, std430) readonly buffer PressureRows { uint pressure_rows[]; };
+layout(set = 0, binding = 11, std430) restrict buffer SweepList { int sweep_pages[]; };
 layout(push_constant, std430) uniform Params {
     ivec4 shape_capacity;
     ivec4 bounds_mode;
@@ -68,9 +74,15 @@ void record_support(uint invocation) {
     ivec4 page = pages[invocation >> 9];
     int local = int(invocation & 511u);
     ivec3 p = page.xyz + ivec3(local & 7, local >> 6, (local >> 3) & 7);
-    int below = material(address(p - ivec3(0, 1, 0)));
-    int above = material(address(p + ivec3(0, 1, 0)));
     int location = page.w * 512 + local;
+    int below, above;
+    if (local >= 64 && local < 448 && p.y + 1 < bounds_mode.y && p.x < bounds_mode.x && p.z < bounds_mode.z) {
+        below = atlas[location - 64];
+        above = atlas[location + 64];
+    } else {
+        below = material(address(p - ivec3(0, 1, 0)));
+        above = material(address(p + ivec3(0, 1, 0)));
+    }
     bool pressurized = above == 3;
     if (!pressurized && axis_parity_count.z != 0 && atlas[location] == 3)
         pressurized = ((pressure_rows[location >> 3] >> (8 + (location & 7))) & 1u) != 0u;
@@ -118,8 +130,9 @@ void integrate_field(uint invocation) {
     float distance_sq = dot(delta, delta);
     bool affected = kind == int(field.z) && field.x > 0.0 && distance_sq < focus.w;
     bool body_contact = body.w != 0 && inside_body(p);
-    bool supported = !can_enter(kind, material(address(p - ivec3(0, 1, 0))));
     if (!affected && !body_contact && (previous >> 2) == 0u && kind == 3) return;
+    int below = local >= 64 && inside(p) ? atlas[location - 64] : material(address(p - ivec3(0, 1, 0)));
+    bool supported = !can_enter(kind, below);
     vec3 velocity = vec3(speed(previous, 0), speed(previous, 1), speed(previous, 2)) / 32.0;
     float dt = intBitsToFloat(region_origin.y);
     vec3 acceleration = vec3(0.0, -intBitsToFloat(region_origin.x), 0.0);
@@ -247,8 +260,14 @@ void exchange_pairs(uint invocation) {
     ivec3 q = p;
     q[axis] += 1;
     int a = page.w * 512 + local.x + 8 * (local.z + 8 * local.y);
-    int b = address(q);
-    if (b < 0 || writable[b / 512] == 0) return;
+    if (q[axis] >= bounds_mode[axis]) return;
+    int b;
+    if (local[axis] < 7) {
+        b = a + (axis == 0 ? 1 : (axis == 1 ? 64 : 8));
+    } else {
+        b = address(q);
+        if (b < 0 || writable[b / 512] == 0) return;
+    }
     int left = atlas[a], right = atlas[b];
     if (left == right) {
         if (left == 2 && axis_parity_count.w != 0) close_sand_contact(a, b, axis);
@@ -304,9 +323,29 @@ int line_address(int offset, int first, int second, int stride) {
     return offset < 8 ? first + offset * stride : second + (offset - 8) * stride;
 }
 
+// Gather once per checkerboard phase. Its pairs have disjoint footprints.
+void collect_sweep_pages(uint invocation) {
+    if (invocation >= uint(active_count)) return;
+    ivec4 page = pages[invocation];
+    int axis = axis_parity_count.x;
+    if (((page[axis] >> 3) & 1) != axis_parity_count.y) return;
+    uint stamp = uint(region_origin.z);
+    if (sweep_tick[page.w] != stamp) {
+        ivec3 neighbor = page.xyz;
+        neighbor[axis] += 8;
+        if (!inside(neighbor)) return;
+        int slot = directory[tile_key(neighbor / 8)];
+        if (slot < 0 || writable[slot] == 0 || sweep_tick[slot] != stamp) return;
+    }
+    sweep_pages[atomicAdd(sweep_pending, 1u)] = int(invocation);
+}
+
 void sweep_lines(uint invocation) {
-    if (invocation >= uint(active_count) * 64u) return;
-    ivec4 page = pages[invocation >> 6];
+    bool compact = axis_parity_count.z != 0;
+    uint size = compact ? sweep_count : uint(active_count);
+    if (invocation >= size * 64u) return;
+    uint index = invocation >> 6;
+    ivec4 page = pages[compact ? sweep_pages[index] : int(index)];
     int axis = axis_parity_count.x;
     if (((page[axis] >> 3) & 1) != axis_parity_count.y) return;
     int lane = int(invocation & 63u);
@@ -320,7 +359,7 @@ void sweep_lines(uint invocation) {
     int second = address(q);
     bool paired = second >= 0 && writable[second / 512] != 0;
     uint stamp = uint(region_origin.z);
-    if (atomicAdd(sweep_tick[page.w], 0u) != stamp
+    if (!compact && atomicAdd(sweep_tick[page.w], 0u) != stamp
             && (!paired || atomicAdd(sweep_tick[second / 512], 0u) != stamp)) return;
     int width = min(bounds_mode[axis] - p[axis], paired ? 16 : 8);
     int strides[3] = int[3](1, 64, 8);
@@ -515,6 +554,7 @@ void expand_frontier(uint invocation) {
 }
 
 void main() {
+    if (blocked != 0) return;
     uint invocation = gl_GlobalInvocationID.x + gl_GlobalInvocationID.y * 16384u * gl_WorkGroupSize.x;
     int mode = bounds_mode.w;
     if (mode == 0) record_support(invocation);
@@ -526,6 +566,7 @@ void main() {
     else if (mode == 11) column_map(invocation);
     else if (mode == 12 && invocation == 0u) trace_ray();
     else if (mode == 13) sweep_lines(invocation);
+    else if (mode == 14) collect_sweep_pages(invocation);
     else if (mode >= 4 && invocation < uint(axis_parity_count.z)) {
         ivec3 p = cells[invocation].xyz;
         if (mode == 4) ensure_page(p & ~7, true);

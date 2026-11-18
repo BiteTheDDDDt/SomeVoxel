@@ -11,6 +11,10 @@ layout(set = 0, binding = 5, std430) readonly buffer Counters {
     int resident;
     int pending_active;
     int active_count;
+    int capacity_misses;
+    int edit_failed;
+    int surface_count;
+    int blocked;
 };
 layout(set = 0, binding = 6, std430) restrict buffer Rows { uint masks[]; };
 struct Run {
@@ -272,6 +276,7 @@ void publish_heads(uint row, uint mask, int y) {
 }
 
 void main() {
+    if (blocked != 0) return;
     uint invocation = gl_GlobalInvocationID.x + gl_GlobalInvocationID.y * 16384u * gl_WorkGroupSize.x;
     int mode = bounds_mode.w;
     if (mode == 0 && invocation == 0u) transfer_count = 0u;
