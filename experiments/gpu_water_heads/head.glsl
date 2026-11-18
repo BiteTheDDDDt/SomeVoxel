@@ -1,6 +1,9 @@
 #[compute]
 #version 450
-layout(local_size_x = 128) in;
+#ifndef HEAD_WORKGROUP_SIZE
+#define HEAD_WORKGROUP_SIZE 128
+#endif
+layout(local_size_x = HEAD_WORKGROUP_SIZE) in;
 layout(set=0,binding=0,std430) readonly buffer Rows { uint rows[]; };
 layout(set=0,binding=1,std430) restrict buffer Runs { uvec2 runs[]; };
 layout(set=0,binding=2,std430) restrict buffer Head { uvec2 heads[]; };
@@ -23,6 +26,18 @@ uint root(uint id) {
         id = ancestor;
     }
 }
+
+// Join is complete before rank and publish. Parent links stay immutable in
+// those passes, so readers can use loads without contending on atomic units.
+uint resolved_root(uint id) {
+    uint parent = runs[id].x;
+    while (parent != id) {
+        id = parent;
+        parent = runs[id].x;
+    }
+    return id;
+}
+
 void join(uint a, uint b) {
     for (;;) {
         a = root(a);
@@ -66,7 +81,7 @@ void main() {
         // Only terminal upward faces may set their component's maximum Y.
         uint last_root = 0xffffffffu;
         for (uint exposed = mask & ~upper; exposed != 0u; exposed &= exposed - 1u) {
-            uint id = root(run_at(row, starts, findLSB(exposed)));
+            uint id = resolved_root(run_at(row, starts, findLSB(exposed)));
             if (id == last_root) continue;
             atomicMax(runs[id].y, y + 1u);
             last_root = id;
@@ -74,7 +89,7 @@ void main() {
     } else {
         uvec2 packed = uvec2(0u);
         for (uint i = 0u; i < count; ++i)
-            packed[i >> 1] |= runs[root(row * 4u + i)].y << ((i & 1u) * 16u);
+            packed[i >> 1] |= runs[resolved_root(row * 4u + i)].y << ((i & 1u) * 16u);
         heads[row] = packed;
     }
 }

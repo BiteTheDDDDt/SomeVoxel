@@ -2,8 +2,10 @@
 
 #include <algorithm>
 #include <array>
+#include <chrono>
 #include <cmath>
 #include <cstdint>
+#include <functional>
 #include <limits>
 #include <memory>
 #include <queue>
@@ -1369,6 +1371,69 @@ public:
     std::optional<PackedParticleState> packed_particle_state(int64_t handle) const;
 
     void step();
+
+    // -1 uses the build setting and 0 uses all available logical processors.
+    void set_water_workers(int limit) {
+#ifdef SOMEVOXEL_PARALLEL_WATER_WORKERS
+        limit = std::max(-1, limit);
+        if (limit != requested_water_workers) {
+            requested_water_workers = limit;
+            water_spans.reset();
+        }
+#else
+        (void)limit;
+#endif
+    }
+
+    int water_worker_count() const {
+#ifdef SOMEVOXEL_PARALLEL_WATER_WORKERS
+        const int detected = int(std::thread::hardware_concurrency());
+        constexpr int configured = SOMEVOXEL_PARALLEL_WATER_WORKERS;
+        const int available = detected > 0 ? detected : configured;
+        if (requested_water_workers == 0) return available;
+        const int limit = requested_water_workers < 0 ? configured : requested_water_workers;
+        return std::min(available, limit);
+#else
+        return 1;
+#endif
+    }
+
+    // A synchronous backend for ordinary water heads. The callback may only
+    // read the packed snapshot and return its heads. It must not mutate this world.
+    using WaterHeadAccelerator = std::function<bool(const std::vector<uint8_t> &, int, int, int,
+        std::vector<uint8_t> &)>;
+
+    void set_water_head_accelerator(WaterHeadAccelerator accelerator) {
+#ifdef SOMEVOXEL_PARALLEL_WATER_WORKERS
+        water_head_accelerator = std::move(accelerator);
+#else
+        (void)accelerator;
+#endif
+    }
+
+    int64_t water_head_accelerated_rebuilds() const {
+#ifdef SOMEVOXEL_PARALLEL_WATER_WORKERS
+        return accelerated_head_rebuilds;
+#else
+        return 0;
+#endif
+    }
+
+    int64_t water_head_accelerator_attempts() const {
+#ifdef SOMEVOXEL_PARALLEL_WATER_WORKERS
+        return accelerator_attempts;
+#else
+        return 0;
+#endif
+    }
+
+    int64_t water_head_accelerator_time_us() const {
+#ifdef SOMEVOXEL_PARALLEL_WATER_WORKERS
+        return accelerator_time_us;
+#else
+        return 0;
+#endif
+    }
 
     int64_t sand_motion() const {
         return (sand_revision << 1) | int(moved_grains != 0 || moved_gravel != 0);

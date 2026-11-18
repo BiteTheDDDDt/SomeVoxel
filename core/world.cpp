@@ -42,6 +42,9 @@ bool World::load_boxes(const int32_t *layout, size_t length) {
     water_positions.clear();
 #ifdef SOMEVOXEL_PARALLEL_WATER_WORKERS
     water_scan_end = 0;
+    accelerated_head_rebuilds = 0;
+    accelerator_attempts = 0;
+    accelerator_time_us = 0;
 #endif
     liquid_motion.clear();
     reset_particle_forms();

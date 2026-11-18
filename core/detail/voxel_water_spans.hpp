@@ -5,6 +5,7 @@
 #include <condition_variable>
 #include <cstdint>
 #include <cstring>
+#include <iterator>
 #include <mutex>
 #include <thread>
 #include <vector>
@@ -150,6 +151,124 @@ public:
         propagate_heads(apply);
     }
 
+    template <typename LiquidMotion, typename Accelerate, typename Apply>
+    bool try_accelerated_rows(const std::vector<uint8_t> &bulk, const LiquidMotion &moving, int height,
+            Accelerate accelerate, Apply apply) {
+        struct Bounds {
+            int x0 = x_rows, y0 = Y, z0 = Z;
+            int x1 = 0, y1 = 0, z1 = 0;
+            void include(int first, int last, int y, int z) {
+                x0 = std::min(x0, first);
+                x1 = std::max(x1, last);
+                y0 = std::min(y0, y);
+                y1 = std::max(y1, y + 1);
+                z0 = std::min(z0, z);
+                z1 = std::max(z1, z + 1);
+            }
+        };
+        std::vector<Bounds> bounds(workers.count);
+        workers.run([&](int id) {
+            Bounds &box = bounds[id];
+            for (int y = 0; y < height; ++y) {
+                for (int z = Z * id / workers.count; z < Z * (id + 1) / workers.count; ++z) {
+                    const uint8_t *line = bulk.data() + y * slice_rows + z * x_rows;
+                    const auto wet = [](uint8_t mask) { return mask != 0; };
+                    const auto first = std::find_if(line, line + x_rows, wet);
+                    if (first == line + x_rows) continue;
+                    const auto last = std::find_if(std::make_reverse_iterator(line + x_rows),
+                        std::make_reverse_iterator(first), wet).base();
+                    box.include(int(first - line), int(last - line), y, z);
+                }
+            }
+        });
+        Bounds box;
+        for (const auto &part : bounds) {
+            if (part.x1 == 0) continue;
+            box.include(part.x0, part.x1, part.y0, part.z0);
+            box.include(part.x0, part.x1, part.y1 - 1, part.z1 - 1);
+        }
+        for (const auto &entry : moving) {
+            const int cell = entry.first;
+            const int x = cell / 8 % x_rows;
+            box.include(x, x + 1, cell / (X * Z), cell / X % Z);
+        }
+        const int width = box.x1 - box.x0, levels = box.y1 - box.y0, depth = box.z1 - box.z0;
+        if (width <= 0 || levels <= 0 || depth <= 0) return false;
+        const size_t count = size_t(width) * depth * levels;
+        if (count > 2000000) return false;
+        accelerator_masks.resize((count + 3) & ~size_t(3));
+        std::fill(accelerator_masks.begin() + count, accelerator_masks.end(), 0);
+        workers.run([&](int id) {
+            for (int y = levels * id / workers.count; y < levels * (id + 1) / workers.count; ++y) {
+                for (int z = 0; z < depth; ++z) {
+                    const size_t dest = size_t(y * depth + z) * width;
+                    const int source = (box.y0 + y) * slice_rows + (box.z0 + z) * x_rows + box.x0;
+                    std::memcpy(accelerator_masks.data() + dest, bulk.data() + source, width);
+                }
+            }
+        });
+        for (const auto &entry : moving) {
+            const int cell = entry.first;
+            const int row = ((cell / (X * Z) - box.y0) * depth + cell / X % Z - box.z0) * width
+                + cell / 8 % x_rows - box.x0;
+            accelerator_masks[row] |= uint8_t(1u << (cell & 7));
+        }
+        if (!accelerate(accelerator_masks, width, levels, depth, accelerator_heads)
+                || accelerator_heads.size() != count * 8) return false;
+
+        const auto head_at = [&](size_t row, int run) {
+            const size_t offset = row * 8 + run * 2;
+            return int(accelerator_heads[offset]) | (int(accelerator_heads[offset + 1]) << 8);
+        };
+        // Validate every occupied run before touching the live world's heads.
+        std::vector<uint8_t> invalid(workers.count);
+        workers.run([&](int id) {
+            for (int y = levels * id / workers.count; y < levels * (id + 1) / workers.count; ++y) {
+                const size_t begin = size_t(y) * depth * width;
+                for (size_t row = begin; row < begin + depth * width; ++row) {
+                    unsigned starts = accelerator_masks[row] & ~(unsigned(accelerator_masks[row]) << 1);
+                    int run = 0;
+                    for (; starts != 0; starts &= starts - 1) {
+                        const int head = head_at(row, run++);
+                        if (head <= y || head > levels) {
+                            invalid[id] = 1;
+                            return;
+                        }
+                    }
+                }
+            }
+        });
+        if (std::find(invalid.begin(), invalid.end(), 1) != invalid.end()) return false;
+
+        // Keep a whole Z chunk on one worker so a wake flag has one writer.
+        const int first_band = box.z0 / 8;
+        const int bands = (box.z1 + 7) / 8 - first_band;
+        workers.run([&](int id) {
+            const int z0 = std::max(box.z0, (first_band + bands * id / workers.count) * 8);
+            const int z1 = std::min(box.z1, (first_band + bands * (id + 1) / workers.count) * 8);
+            for (int y = 0; y < levels; ++y) {
+                for (int z = z0; z < z1; ++z) {
+                    const int source = (box.y0 + y) * slice_rows + z * x_rows + box.x0;
+                    for (int x = 0; x < width; ++x) {
+                        const size_t row = size_t(y * depth + z - box.z0) * width + x;
+                        const int cell = (source + x) * 8;
+                        unsigned mask = accelerator_masks[row];
+                        bool previous_wet = false;
+                        int run = 0;
+                        int head = 0;
+                        for (int offset = 0; mask != 0; ++offset, mask >>= 1) {
+                            const bool wet = (mask & 1u) != 0;
+                            if (wet && !previous_wet) head = head_at(row, run++) + box.y0;
+                            if (wet) apply(cell + offset, head);
+                            previous_wet = wet;
+                        }
+                    }
+                }
+            }
+        });
+        return true;
+    }
+
     size_t scratch_bytes() const {
         size_t bytes = rows.capacity() * sizeof(Row) + spans.capacity() * sizeof(Span);
         for (const auto &rows : rows_by_z) bytes += rows.capacity() * sizeof(int);
@@ -231,6 +350,7 @@ private:
     HeadWorkers workers;
     std::vector<Row> rows;
     std::vector<Span> spans;
+    std::vector<uint8_t> accelerator_masks, accelerator_heads;
     std::array<std::vector<int>, z_blocks> rows_by_z;
     std::vector<int> bands;
 

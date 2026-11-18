@@ -1,8 +1,10 @@
 #pragma once
 
 #include "world_presentation.hpp"
+#include <cstring>
 #include <godot_cpp/classes/ref_counted.hpp>
 #include <godot_cpp/core/class_db.hpp>
+#include <godot_cpp/variant/callable.hpp>
 #include <godot_cpp/variant/dictionary.hpp>
 
 namespace somevoxel {
@@ -35,6 +37,8 @@ protected:
         using godot::D_METHOD;
         ClassDB::bind_method(D_METHOD("load_boxes", "layout"), &VoxelWorld::load_boxes);
         ClassDB::bind_method(D_METHOD("step"), &VoxelWorld::step);
+        ClassDB::bind_method(D_METHOD("set_water_workers", "limit"), &VoxelWorld::set_water_workers);
+        ClassDB::bind_method(D_METHOD("set_water_head_accelerator", "solve"), &VoxelWorld::set_water_head_accelerator);
         ClassDB::bind_method(D_METHOD("packed_particle_mass", "extent"), &VoxelWorld::packed_particle_mass);
         ClassDB::bind_method(D_METHOD("spawn_packed_particle", "position", "extent", "impulse"),
             &VoxelWorld::spawn_packed_particle, DEFVAL(V3()));
@@ -113,6 +117,27 @@ protected:
     }
 
 public:
+    void set_water_workers(int limit) { world.set_water_workers(limit); }
+
+    void set_water_head_accelerator(const godot::Callable &solve) {
+        if (!solve.is_valid()) {
+            world.set_water_head_accelerator({});
+            return;
+        }
+        world.set_water_head_accelerator([solve](const std::vector<uint8_t> &masks,
+                int width, int height, int depth, std::vector<uint8_t> &heads) {
+            godot::PackedByteArray input;
+            if (input.resize(masks.size()) != godot::OK) return false;
+            std::memcpy(input.ptrw(), masks.data(), masks.size());
+            const godot::Variant result = solve.call(input, godot::Vector3i(width, height, depth));
+            if (result.get_type() != godot::Variant::PACKED_BYTE_ARRAY) return false;
+            const godot::PackedByteArray output = result;
+            if (output.is_empty()) return false;
+            heads.assign(output.ptr(), output.ptr() + output.size());
+            return true;
+        });
+    }
+
     bool load_boxes(const godot::PackedInt32Array &layout) {
         return world.load_boxes(layout.ptr(), layout.size());
     }
@@ -144,6 +169,10 @@ public:
         result["cell_size"] = state.cell_size;
         result["step_seconds"] = state.step_seconds;
         result["bulk_water_hz"] = state.bulk_water_hz;
+        result["water_workers"] = world.water_worker_count();
+        result["water_head_accelerated_rebuilds"] = world.water_head_accelerated_rebuilds();
+        result["water_head_accelerator_attempts"] = world.water_head_accelerator_attempts();
+        result["water_head_accelerator_time_us"] = world.water_head_accelerator_time_us();
         result["voxel_bytes"] = state.voxel_bytes;
         result["grain_bytes"] = state.grain_bytes;
         result["dense_grid_bytes"] = state.dense_grid_bytes;

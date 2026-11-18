@@ -13,6 +13,11 @@ private:
     std::vector<LiquidHead> previous_water_heads;
 #ifdef SOMEVOXEL_PARALLEL_WATER_WORKERS
     std::unique_ptr<WaterSpans<nx, ny, nz>> water_spans;
+    int requested_water_workers = -1;
+    WaterHeadAccelerator water_head_accelerator;
+    int64_t accelerated_head_rebuilds = 0;
+    int64_t accelerator_attempts = 0;
+    int64_t accelerator_time_us = 0;
 #endif
     std::vector<int> pressure_component;
     std::vector<PressureNode> pressure_nodes;
@@ -136,10 +141,7 @@ private:
 #ifdef SOMEVOXEL_PARALLEL_WATER_WORKERS
         if (!balance && water_positions.size() >= 16384) {
             if (!water_spans) {
-                const unsigned available = std::thread::hardware_concurrency();
-                constexpr unsigned configured = SOMEVOXEL_PARALLEL_WATER_WORKERS;
-                const unsigned workers = available == 0 ? configured : std::min(available, configured);
-                water_spans = std::make_unique<WaterSpans<nx, ny, nz>>(int(workers));
+                water_spans = std::make_unique<WaterSpans<nx, ny, nz>>(water_worker_count());
             }
             const auto apply_head = [this](int i, int head) {
                 if (head == liquid_head[i]) return;
@@ -147,6 +149,18 @@ private:
                 const I3 p = decode(i);
                 awake[chunk_id({p.x / block, p.y / block, p.z / block})] = true;
             };
+            if (water_head_accelerator && water_positions.size() >= 1000000) {
+                const auto start = std::chrono::steady_clock::now();
+                const bool solved = water_spans->try_accelerated_rows(bulk_water_rows, liquid_motion,
+                    water_scan_end / slice, water_head_accelerator, apply_head);
+                ++accelerator_attempts;
+                accelerator_time_us += std::chrono::duration_cast<std::chrono::microseconds>(
+                    std::chrono::steady_clock::now() - start).count();
+                if (solved) {
+                    ++accelerated_head_rebuilds;
+                    return;
+                }
+            }
             // Sparse scenes still benefit from visiting just their parcel list.
             if (size_t(water_scan_end / block) <= 4 * water_positions.size())
                 water_spans->rebuild_rows(bulk_water_rows, liquid_motion, water_scan_end / slice, apply_head);
