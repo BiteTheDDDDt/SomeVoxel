@@ -135,7 +135,12 @@ private:
 
 #ifdef SOMEVOXEL_PARALLEL_WATER_WORKERS
         if (!balance && water_positions.size() >= 16384) {
-            if (!water_spans) water_spans = std::make_unique<WaterSpans<nx, ny, nz>>(SOMEVOXEL_PARALLEL_WATER_WORKERS);
+            if (!water_spans) {
+                const unsigned available = std::thread::hardware_concurrency();
+                constexpr unsigned configured = SOMEVOXEL_PARALLEL_WATER_WORKERS;
+                const unsigned workers = available == 0 ? configured : std::min(available, configured);
+                water_spans = std::make_unique<WaterSpans<nx, ny, nz>>(int(workers));
+            }
             const auto apply_head = [this](int i, int head) {
                 if (head == liquid_head[i]) return;
                 liquid_head[i] = LiquidHead(head);
