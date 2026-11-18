@@ -168,6 +168,9 @@ private:
     std::vector<int> visible_sand;
     int64_t visibility_revision = -1;
     std::vector<int> water_positions;
+#ifdef SOMEVOXEL_PARALLEL_WATER_WORKERS
+    int water_scan_end = 0;
+#endif
     // Current and proposed occupancy use one two-bit field per voxel.
     std::vector<uint8_t> body_mask;
     std::vector<int> body_cells;
@@ -268,6 +271,9 @@ private:
     void sync_bulk_water(int i) {
         const auto bit = uint8_t(1u << (i % block));
         const Voxel &cell = voxels[i];
+#ifdef SOMEVOXEL_PARALLEL_WATER_WORKERS
+        if (cell.kind == Water && i >= water_scan_end) water_scan_end = (i / slice + 1) * slice;
+#endif
         if (cell.kind == Water && !cell.liquid_moving) bulk_water_rows[i / block] |= bit;
         else bulk_water_rows[i / block] &= uint8_t(~bit);
     }

@@ -4,6 +4,7 @@
 #include <array>
 #include <condition_variable>
 #include <cstdint>
+#include <cstring>
 #include <mutex>
 #include <thread>
 #include <vector>
@@ -97,12 +98,72 @@ public:
 
     template <typename Apply> void rebuild(const std::vector<int> &water_positions, Apply apply) {
         if (rows.empty()) rows.resize(X * Y * Z / 8);
-        for (int i : water_positions) {
-            Row &row = rows[i / 8];
-            if (!row.occupied) rows_by_z[i / X % Z / 8].push_back(i / 8);
-            row.occupied |= uint8_t(1u << (i % 8));
-        }
+        for (int i : water_positions) mark_water(i);
+        propagate_heads(apply);
+    }
 
+    template <typename LiquidMotion, typename Apply>
+    void rebuild_rows(const std::vector<uint8_t> &bulk, const LiquidMotion &moving, int height, Apply apply) {
+        if (rows.empty()) rows.resize(X * Y * Z / 8);
+        // Entire Z bands belong to one worker. The packed source rows are
+        // already available from the simulation's live occupancy masks.
+        const auto run_bands = [&](auto visit) {
+            workers.run([&](int k) {
+                const int first = z_blocks * k / workers.count;
+                const int last = z_blocks * (k + 1) / workers.count;
+                for (int z = first; z < last; ++z) visit(z);
+            });
+        };
+        std::array<int, z_blocks> occupied_counts{};
+        run_bands([&](int z) {
+            int count = 0;
+            for (int y = 0; y < height; ++y) {
+                auto first = bulk.begin() + y * slice_rows + z * 8 * x_rows;
+                count += int(std::count_if(first, first + 8 * x_rows, [](uint8_t mask) { return mask != 0; }));
+            }
+            occupied_counts[z] = count;
+        });
+        // Allocate on the caller. The workers only touch pre-sized vectors.
+        for (int z = 0; z < z_blocks; ++z) rows_by_z[z].resize(occupied_counts[z]);
+        run_bands([&](int z) {
+            auto output = rows_by_z[z].begin();
+            for (int y = 0; y < height; ++y) {
+                int row = y * slice_rows + z * 8 * x_rows;
+                const int end = row + 8 * x_rows;
+                // Every band contains a multiple of eight bytes.
+                for (; row < end; row += 8) {
+                    uint64_t packed;
+                    std::memcpy(&packed, bulk.data() + row, sizeof(packed));
+                    if (!packed) continue;
+                    for (int offset = 0; offset < 8; ++offset) {
+                        const uint8_t mask = bulk[row + offset];
+                        if (!mask) continue;
+                        rows[row + offset].occupied = mask;
+                        *output++ = row + offset;
+                    }
+                }
+            }
+        });
+        // Moving parcels are absent from bulk rows but participate in the
+        // same face-connected components and hydraulic heads.
+        for (const auto &entry : moving) mark_water(entry.first);
+        propagate_heads(apply);
+    }
+
+    size_t scratch_bytes() const {
+        size_t bytes = rows.capacity() * sizeof(Row) + spans.capacity() * sizeof(Span);
+        for (const auto &rows : rows_by_z) bytes += rows.capacity() * sizeof(int);
+        return bytes;
+    }
+
+private:
+    void mark_water(int i) {
+        Row &row = rows[i / 8];
+        if (!row.occupied) rows_by_z[i / X % Z / 8].push_back(i / 8);
+        row.occupied |= uint8_t(1u << (i % 8));
+    }
+
+    template <typename Apply> void propagate_heads(Apply apply) {
         std::array<int, z_blocks + 1> offsets{};
         std::array<int, z_blocks + 1> weights{};
         for (int z = 0; z < z_blocks; ++z) {
@@ -167,13 +228,6 @@ public:
         });
     }
 
-    size_t scratch_bytes() const {
-        size_t bytes = rows.capacity() * sizeof(Row) + spans.capacity() * sizeof(Span);
-        for (const auto &rows : rows_by_z) bytes += rows.capacity() * sizeof(int);
-        return bytes;
-    }
-
-private:
     HeadWorkers workers;
     std::vector<Row> rows;
     std::vector<Span> spans;

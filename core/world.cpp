@@ -40,6 +40,9 @@ bool World::load_boxes(const int32_t *layout, size_t length) {
     tracked_packed_particles.clear();
     rock_fragments.clear();
     water_positions.clear();
+#ifdef SOMEVOXEL_PARALLEL_WATER_WORKERS
+    water_scan_end = 0;
+#endif
     liquid_motion.clear();
     reset_particle_forms();
     charge_gather = 0.f;

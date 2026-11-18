@@ -136,12 +136,17 @@ private:
 #ifdef SOMEVOXEL_PARALLEL_WATER_WORKERS
         if (!balance && water_positions.size() >= 16384) {
             if (!water_spans) water_spans = std::make_unique<WaterSpans<nx, ny, nz>>(SOMEVOXEL_PARALLEL_WATER_WORKERS);
-            water_spans->rebuild(water_positions, [this](int i, int head) {
+            const auto apply_head = [this](int i, int head) {
                 if (head == liquid_head[i]) return;
                 liquid_head[i] = LiquidHead(head);
                 const I3 p = decode(i);
                 awake[chunk_id({p.x / block, p.y / block, p.z / block})] = true;
-            });
+            };
+            // Sparse scenes still benefit from visiting just their parcel list.
+            if (size_t(water_scan_end / block) <= 4 * water_positions.size())
+                water_spans->rebuild_rows(bulk_water_rows, liquid_motion, water_scan_end / slice, apply_head);
+            else
+                water_spans->rebuild(water_positions, apply_head);
             return;
         }
 #endif
