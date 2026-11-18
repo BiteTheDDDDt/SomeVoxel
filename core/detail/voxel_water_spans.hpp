@@ -181,14 +181,22 @@ private:
     std::vector<int> bands;
 
     static int first_bit(unsigned bits) {
+#if defined(__GNUC__) || defined(__clang__)
+        return __builtin_ctz(bits);
+#else
         int n = 0;
         while (!(bits & 1)) { ++n; bits >>= 1; }
         return n;
+#endif
     }
     static int popcount(unsigned bits) {
+#if defined(__GNUC__) || defined(__clang__)
+        return __builtin_popcount(bits);
+#else
         int n = 0;
         while (bits) { bits &= bits - 1; ++n; }
         return n;
+#endif
     }
 
     int root(int id) const {

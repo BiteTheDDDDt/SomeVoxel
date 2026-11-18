@@ -208,7 +208,7 @@ void World::step() {
             }
         }
         active_count += count;
-        for (int y = cy * block; y < (cy + 1) * block; ++y) {
+        for (int y = cy * block; y < std::min(ny, (cy + 1) * block); ++y) {
             for (int entry = 0; entry < count; ++entry) {
                 const I3 chunk = slab_chunks[entry];
                 for (int z = 0; z < block; ++z) {

@@ -14,6 +14,9 @@
 #include <vector>
 #include <optional>
 #include "types.hpp"
+#if defined(SOMEVOXEL_PARALLEL_WATER_WORKERS) || defined(SOMEVOXEL_PARALLEL_RENDER_WORKERS)
+#include "detail/voxel_water_spans.hpp"
+#endif
 
 namespace somevoxel {
 
@@ -29,9 +32,9 @@ class World {
     static constexpr int block = 8;
     static constexpr int nx = 72 * refinement, ny = 36 * refinement, nz = 56 * refinement;
     static constexpr int slice = nx * nz;
-    static constexpr int bx = nx / block, by = ny / block, bz = nz / block;
+    static constexpr int bx = nx / block, by = (ny + block - 1) / block, bz = nz / block;
     static constexpr int chunk_count = bx * by * bz;
-    static_assert(nx % block == 0 && ny % block == 0 && nz % block == 0);
+    static_assert(nx % block == 0 && nz % block == 0);
     static constexpr float scale = 0.18f / refinement;
     static constexpr int reference_hz = 30 * refinement;
 #ifdef SOMEVOXEL_EXPERIMENTAL_SIMULATION_HZ
@@ -2017,6 +2020,9 @@ public:
         data.dense_grid_bytes = voxels.size() * sizeof(Voxel) + mobile_rows.size() + bulk_water_rows.size() +
             (liquid_head.size() + previous_water_heads.capacity()) * sizeof(LiquidHead) +
             body_mask.size() + support_seen.size() * sizeof(SupportStamp);
+#ifdef SOMEVOXEL_PARALLEL_WATER_WORKERS
+        if (water_spans) data.dense_grid_bytes += water_spans->scratch_bytes();
+#endif
         data.sand = grains.size();
         data.gravel = gravel.size();
         const int loose_and_mud = int(grains.size() + element_cells(Mud).size());

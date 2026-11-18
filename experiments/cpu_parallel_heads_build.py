@@ -94,7 +94,7 @@ def main():
         tar.extractall(out, filter="data")
     include = '#include "types.hpp"'
     replace_once(out / "core" / "world.hpp", include,
-                 '#include <chrono>\n#include <cstring>\n#include "cpu_parallel_heads.hpp"\n' + include)
+                 '#include <chrono>\n#include <cstring>\n#include "voxel_water_spans.hpp"\n' + include)
     include = '#include "detail/voxel_liquid_pressure.hpp"'
     replace_once(out / "core" / "world.hpp", include, include + "\n" + PROBE_FIELDS)
     marker = "        // Only occupied water cells participate"
@@ -103,7 +103,7 @@ def main():
                          (out / "tests" / "world_smoke.cpp", "world_smoke")]:
         exe = out / (name + (".exe" if os.name == "nt" else ""))
         subprocess.run([args.cxx, "-std=c++17", "-O3", "-DNDEBUG", "-pthread",
-                        f"-DSOMEVOXEL_REFINEMENT={args.refinement}", "-I", str(out), "-I", str(experiments),
+                        f"-DSOMEVOXEL_REFINEMENT={args.refinement}", "-I", str(out), "-I", str(root / "core" / "detail"),
                         str(source), str(out / "core" / "world.cpp"), "-o", str(exe)], check=True)
         print(exe)
 

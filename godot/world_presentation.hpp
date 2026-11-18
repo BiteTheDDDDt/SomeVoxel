@@ -20,6 +20,11 @@ class WorldPresentation final : public World {
     using V3 = Vec3;
     using I3 = Cell;
 
+#ifdef SOMEVOXEL_PARALLEL_RENDER_WORKERS
+    mutable std::unique_ptr<HeadWorkers> render_workers;
+    std::array<std::vector<int>, SOMEVOXEL_PARALLEL_RENDER_WORKERS> worker_visibility;
+#endif
+
 public:
     godot::PackedFloat32Array sand_buffer(float alpha) const {
         return build_particle_buffer(Sand, alpha, grain_count(), nullptr);
@@ -45,23 +50,39 @@ public:
         const bool filter = material == Sand && cull;
         if (filter && visibility_revision != sand_revision) {
             visible_sand.clear();
-            for (int i = 0; i < int(grains.size()); ++i) {
-                const Grain &g = grains[i];
-                if (g.moved == tick && g.previous != g.position) {
-                    visible_sand.push_back(i);
-                    continue;
+            const auto select = [&](int start, int end, std::vector<int> &visible) {
+                for (int i = start; i < end; ++i) {
+                    const Grain &g = grains[i];
+                    if (g.moved == tick && g.previous != g.position) {
+                        visible.push_back(i);
+                        continue;
+                    }
+                    const I3 p = decode(g.position);
+                    // Cull only sand fully inside other sand. Stone, gravel, and
+                    // water are deliberately ignored to keep contact surfaces visible.
+                    const int n = g.position;
+                    if (p.x == 0 || p.x == nx - 1 || p.y == 0 || p.y == ny - 1 ||
+                            p.z == 0 || p.z == nz - 1 ||
+                            voxels[n - 1].kind != Sand || voxels[n + 1].kind != Sand ||
+                            voxels[n - nx].kind != Sand || voxels[n + nx].kind != Sand ||
+                            voxels[n - slice].kind != Sand || voxels[n + slice].kind != Sand)
+                        visible.push_back(i);
                 }
-                const I3 p = decode(g.position);
-                // Cull only sand fully inside other sand. Stone, gravel, and
-                // water are deliberately ignored to keep contact surfaces visible.
-                const int n = g.position;
-                if (p.x == 0 || p.x == nx - 1 || p.y == 0 || p.y == ny - 1 ||
-                        p.z == 0 || p.z == nz - 1 ||
-                        voxels[n - 1].kind != Sand || voxels[n + 1].kind != Sand ||
-                        voxels[n - nx].kind != Sand || voxels[n + nx].kind != Sand ||
-                        voxels[n - slice].kind != Sand || voxels[n + slice].kind != Sand)
-                    visible_sand.push_back(i);
-            }
+            };
+#ifdef SOMEVOXEL_PARALLEL_RENDER_WORKERS
+            if (grains.size() >= 65536) {
+                constexpr int count = SOMEVOXEL_PARALLEL_RENDER_WORKERS;
+                if (!render_workers) render_workers = std::make_unique<HeadWorkers>(count);
+                render_workers->run([&](int worker) {
+                    auto &visible = worker_visibility[worker];
+                    visible.clear();
+                    select(int(grains.size() * worker / count), int(grains.size() * (worker + 1) / count), visible);
+                });
+                for (const auto &visible : worker_visibility)
+                    visible_sand.insert(visible_sand.end(), visible.begin(), visible.end());
+            } else
+#endif
+                select(0, int(grains.size()), visible_sand);
             visibility_revision = sand_revision;
         }
         int count = material == Water ? formed_water_count : material == Rock ? int(rock_fragments.size())
@@ -96,9 +117,10 @@ public:
 
     template <bool Colored, typename Palette>
     void append_particle_instances(float *&data, const std::vector<Grain> &particles,
-            const std::vector<int> *selection, float blend, float size_factor, Palette color) const {
-        const int count = selection == nullptr ? int(particles.size()) : int(selection->size());
-        for (int entry = 0; entry < count; ++entry) {
+            const std::vector<int> *selection, float blend, float size_factor, Palette color,
+            int start = 0, int end = -1) const {
+        if (end < 0) end = selection == nullptr ? int(particles.size()) : int(selection->size());
+        for (int entry = start; entry < end; ++entry) {
             const int i = selection == nullptr ? entry : (*selection)[entry];
             const Grain &grain = particles[i];
             append_particle_transform(data, grain, blend, size_factor);
@@ -133,9 +155,24 @@ public:
         } else {
             buffer.resize(capacity * 16);
             float *data = buffer.ptrw();
-            append_particle_instances<true>(data, grains, selection, blend, 0.974f, [](const Grain &, float tint) {
+            const auto sand_color = [](const Grain &, float tint) {
                 return V3(0.56f + tint * 0.19f, 0.29f + tint * 0.14f, 0.115f + tint * 0.093f);
-            });
+            };
+#ifdef SOMEVOXEL_PARALLEL_RENDER_WORKERS
+            const size_t grain_count = selection ? selection->size() : grains.size();
+            if (grain_count >= 65536) {
+                constexpr int count = SOMEVOXEL_PARALLEL_RENDER_WORKERS;
+                if (!render_workers) render_workers = std::make_unique<HeadWorkers>(count);
+                render_workers->run([&](int worker) {
+                    const int start = int(grain_count * worker / count);
+                    const int end = int(grain_count * (worker + 1) / count);
+                    float *output = data + size_t(start) * 16;
+                    append_particle_instances<true>(output, grains, selection, blend, 0.974f, sand_color, start, end);
+                });
+                data += grain_count * 16;
+            } else
+#endif
+                append_particle_instances<true>(data, grains, selection, blend, 0.974f, sand_color);
             append_particle_instances<true>(data, gravel, nullptr, blend, 0.98f, [](const Grain &grain, float tint) {
                 const V3 base = grain.extent == 8 ? V3(0.24f, 0.104f, 0.065f) :
                     grain.extent == 4 ? V3(0.33f, 0.153f, 0.075f) : V3(0.41f, 0.218f, 0.11f);

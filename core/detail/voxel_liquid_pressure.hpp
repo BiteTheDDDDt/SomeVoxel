@@ -11,6 +11,9 @@ private:
     std::array<std::vector<int>, ny> water_by_height;
     std::vector<LiquidHead> liquid_head;
     std::vector<LiquidHead> previous_water_heads;
+#ifdef SOMEVOXEL_PARALLEL_WATER_WORKERS
+    std::unique_ptr<WaterSpans<nx, ny, nz>> water_spans;
+#endif
     std::vector<int> pressure_component;
     std::vector<PressureNode> pressure_nodes;
     std::vector<int> pressure_sources;
@@ -129,6 +132,19 @@ private:
             pressure_body_height = body_height;
             pressure_nodes.resize(water_positions.size());
         }
+
+#ifdef SOMEVOXEL_PARALLEL_WATER_WORKERS
+        if (!balance && water_positions.size() >= 16384) {
+            if (!water_spans) water_spans = std::make_unique<WaterSpans<nx, ny, nz>>(SOMEVOXEL_PARALLEL_WATER_WORKERS);
+            water_spans->rebuild(water_positions, [this](int i, int head) {
+                if (head == liquid_head[i]) return;
+                liquid_head[i] = LiquidHead(head);
+                const I3 p = decode(i);
+                awake[chunk_id({p.x / block, p.y / block, p.z / block})] = true;
+            });
+            return;
+        }
+#endif
 
         // Only occupied water cells participate in the wake comparison. Keep
         // the snapshot by parcel ID for the duration of this rebuild.
