@@ -2,6 +2,7 @@
 
 #include "../core/world.hpp"
 #include <godot_cpp/variant/array.hpp>
+#include <godot_cpp/variant/packed_byte_array.hpp>
 #include <godot_cpp/variant/packed_color_array.hpp>
 #include <godot_cpp/variant/packed_float32_array.hpp>
 #include <godot_cpp/variant/packed_int32_array.hpp>
@@ -48,7 +49,30 @@ public:
         const bool debris = structure_kind(material);
         if (material != Sand && material != Rock && material != Water && !debris) return {};
         const bool filter = material == Sand && cull;
-        if (filter && visibility_revision != sand_revision) {
+        if (filter) update_sand_visibility();
+        int count = material == Water ? formed_water_count : material == Rock ? int(rock_fragments.size())
+            : filter ? int(visible_sand.size() + gravel.size()) : grain_count();
+        if (debris) {
+            const auto &particles = element_grains[element_grain_slot(Kind(material))];
+            count = int(std::count_if(particles.begin(), particles.end(), [&](const Grain &grain) {
+                return mobile_at(grain.position);
+            }));
+        }
+        int capacity = count;
+        if (count > 0 && (material != Sand || filter)) {
+            const int padded = (count + 511) & ~511;
+            capacity = previous_capacity < count || previous_capacity > padded + std::max(padded / 2, 512)
+                ? padded : previous_capacity;
+        }
+        godot::Array result;
+        result.push_back(count);
+        result.push_back(capacity);
+        result.push_back(build_particle_buffer(material, alpha, capacity, filter ? &visible_sand : nullptr));
+        return result;
+    }
+
+    void update_sand_visibility() {
+        if (visibility_revision != sand_revision) {
             visible_sand.clear();
             const auto select = [&](int start, int end, std::vector<int> &visible) {
                 for (int i = start; i < end; ++i) {
@@ -85,24 +109,87 @@ public:
                 select(0, int(grains.size()), visible_sand);
             visibility_revision = sand_revision;
         }
-        int count = material == Water ? formed_water_count : material == Rock ? int(rock_fragments.size())
-            : filter ? int(visible_sand.size() + gravel.size()) : grain_count();
-        if (debris) {
-            const auto &particles = element_grains[element_grain_slot(Kind(material))];
-            count = int(std::count_if(particles.begin(), particles.end(), [&](const Grain &grain) {
-                return mobile_at(grain.position);
-            }));
+    }
+
+    static V3 sand_color(float tint) {
+        return V3(0.56f + tint * 0.19f, 0.29f + tint * 0.14f, 0.115f + tint * 0.093f);
+    }
+
+    static V3 gravel_color(int extent, bool compacted, float tint) {
+        const V3 base = extent == 8 ? V3(0.24f, 0.104f, 0.065f) :
+            extent == 4 ? V3(0.33f, 0.153f, 0.075f) : V3(0.41f, 0.218f, 0.11f);
+        const V3 color = base + V3(tint * 0.09f, tint * 0.06f, tint * 0.04f);
+        return color * (compacted ? 0.74f : 1.f);
+    }
+
+    godot::PackedByteArray sand_palette() const {
+        godot::PackedFloat32Array values;
+        values.resize(256 * 8 * 4);
+        float *out = values.ptrw();
+        for (int style = 0; style < 8; ++style) {
+            for (int tint = 0; tint < 256; ++tint) {
+                const int extent = 1 << (style & 3);
+                const V3 color = extent == 1 ? sand_color(tint / 255.f) :
+                    gravel_color(extent, (style & 4) != 0, tint / 255.f);
+                *out++ = color.x;
+                *out++ = color.y;
+                *out++ = color.z;
+                *out++ = 1.0f;
+            }
         }
-        int capacity = count;
-        if (count > 0 && (material != Sand || filter)) {
-            const int padded = (count + 511) & ~511;
-            capacity = previous_capacity < count || previous_capacity > padded + std::max(padded / 2, 512)
-                ? padded : previous_capacity;
+        return values.to_byte_array();
+    }
+
+    godot::Array sand_snapshot(bool cull, int previous_rows) {
+        // RGBA32F stores exact integers through 2^24. The pair of coordinates
+        // per channel therefore fits for dimensions up to 4096 cells.
+        if constexpr (nx > 4096 || ny > 4096 || nz > 4096) return {};
+        if (cull) update_sand_visibility();
+        const int sand_count = int(cull ? visible_sand.size() : grains.size());
+        const int count = sand_count + int(gravel.size());
+        constexpr int width = 1024;
+        const int needed = (count + width - 1) / width;
+        if (needed > 16384) return {};
+        const int padded = (needed + 3) & ~3;
+        const int rows = count == 0 ? 0 : previous_rows >= needed && previous_rows <= 16384 &&
+            previous_rows <= padded + std::max(padded / 2, 4) ? previous_rows : padded;
+        godot::PackedFloat32Array data;
+        data.resize(rows * width * 4);
+        float *cells = data.ptrw();
+        const auto write_grain = [&](float *out, const Grain &grain, int index, int style) {
+            const I3 current = decode(grain.position);
+            const I3 previous = grain.moved == tick && grain.previous != grain.position ? decode(grain.previous) : current;
+            out[0] = float(current.x + nx * previous.x);
+            out[1] = float(current.y + ny * previous.y);
+            out[2] = float(current.z + nz * previous.z);
+            out[3] = float((hash(uint32_t(index)) & 255u) | (uint32_t(style) << 8));
+        };
+        const auto pack_sand = [&](int start, int end) {
+            for (int i = start; i < end; ++i) {
+                const int index = cull ? visible_sand[i] : i;
+                write_grain(cells + size_t(i) * 4, grains[index], index, 0);
+            }
+        };
+#ifdef SOMEVOXEL_PARALLEL_RENDER_WORKERS
+        if (sand_count >= 65536) {
+            constexpr int workers = SOMEVOXEL_PARALLEL_RENDER_WORKERS;
+            if (!render_workers) render_workers = std::make_unique<HeadWorkers>(workers);
+            render_workers->run([&](int id) {
+                pack_sand(int(int64_t(sand_count) * id / workers), int(int64_t(sand_count) * (id + 1) / workers));
+            });
+        } else
+#endif
+            pack_sand(0, sand_count);
+        for (int i = 0; i < int(gravel.size()); ++i) {
+            const Grain &grain = gravel[i];
+            const int style = (grain.extent == 8 ? 3 : grain.extent == 4 ? 2 : 1) | (grain.sand_units ? 4 : 0);
+            write_grain(cells + size_t(sand_count + i) * 4, grain, i, style);
         }
         godot::Array result;
         result.push_back(count);
-        result.push_back(capacity);
-        result.push_back(build_particle_buffer(material, alpha, capacity, filter ? &visible_sand : nullptr));
+        result.push_back(width);
+        result.push_back(rows);
+        result.push_back(data.to_byte_array());
         return result;
     }
 
@@ -156,7 +243,7 @@ public:
             buffer.resize(capacity * 16);
             float *data = buffer.ptrw();
             const auto sand_color = [](const Grain &, float tint) {
-                return V3(0.56f + tint * 0.19f, 0.29f + tint * 0.14f, 0.115f + tint * 0.093f);
+                return WorldPresentation::sand_color(tint);
             };
 #ifdef SOMEVOXEL_PARALLEL_RENDER_WORKERS
             const size_t grain_count = selection ? selection->size() : grains.size();
@@ -174,10 +261,7 @@ public:
 #endif
                 append_particle_instances<true>(data, grains, selection, blend, 0.974f, sand_color);
             append_particle_instances<true>(data, gravel, nullptr, blend, 0.98f, [](const Grain &grain, float tint) {
-                const V3 base = grain.extent == 8 ? V3(0.24f, 0.104f, 0.065f) :
-                    grain.extent == 4 ? V3(0.33f, 0.153f, 0.075f) : V3(0.41f, 0.218f, 0.11f);
-                const V3 color = base + V3(tint * 0.09f, tint * 0.06f, tint * 0.04f);
-                return color * (grain.sand_units ? 0.74f : 1.f);
+                return WorldPresentation::gravel_color(grain.extent, grain.sand_units != 0, tint);
             });
         }
         return buffer;

@@ -86,6 +86,8 @@ protected:
         ClassDB::bind_method(D_METHOD("particle_motion", "material"), &VoxelWorld::particle_motion);
         ClassDB::bind_method(D_METHOD("particle_batch", "material", "interpolation", "previous_capacity", "cull"),
             &VoxelWorld::particle_batch);
+        ClassDB::bind_method(D_METHOD("sand_snapshot", "cull", "previous_rows"), &VoxelWorld::sand_snapshot);
+        ClassDB::bind_method(D_METHOD("sand_palette"), &VoxelWorld::sand_palette);
         ClassDB::bind_method(D_METHOD("range_count", "material", "minimum", "maximum"), &VoxelWorld::range_count);
         ClassDB::bind_method(D_METHOD("status"), &VoxelWorld::status);
         ClassDB::bind_method(D_METHOD("sand_impact_peak", "material"), &VoxelWorld::sand_impact_peak);
@@ -389,6 +391,9 @@ public:
     godot::Array particle_batch(int material, float alpha, int previous_capacity, bool cull) {
         return world.particle_batch(material, alpha, previous_capacity, cull);
     }
+
+    godot::Array sand_snapshot(bool cull, int previous_rows) { return world.sand_snapshot(cull, previous_rows); }
+    godot::PackedByteArray sand_palette() const { return world.sand_palette(); }
 
     int range_count(int material, godot::Vector3i lo, godot::Vector3i hi) const {
         return world.range_count(material, somevoxel::from_godot(lo), somevoxel::from_godot(hi));
