@@ -38,6 +38,10 @@ for tick in 120:
 assert(world.status().sand_mass == 64)
 ```
 
+### Rendering sand from the CPU world
+
+`VoxelWorld.sand_snapshot(cull, previous_rows)` packs the CPU world's current and previous cell indices into an RGBA32F texture, using 16 bytes per slot. It returns the visible instance count, width, height, texture bytes, and the three bit shifts for decoding coordinates. The installed `presentation/sand_instances.gdshader` decodes the positions, interpolates in the vertex shader, and samples the colors returned by `sand_palette()`. Use an origin-aligned MultiMesh with a custom AABB that covers the world. Update the snapshot when the full `particle_motion(2)` value or visibility settings change and supply the render interpolation fraction every frame. The regular `particle_batch()` output remains available for conventional rendering.
+
 ## Godot GPU material world
 
 The addon also includes a sparse compute backend under `addons/somevoxel/gpu` for Godot 4.6+ with Vulkan and Forward+. It uses a local RenderingDevice. The host uploads ordered boxes, and the device owns subsequent material state, page allocation, and dispatch sizing.

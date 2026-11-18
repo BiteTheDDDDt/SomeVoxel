@@ -140,6 +140,12 @@ public:
         return values.to_byte_array();
     }
 
+    static constexpr int coordinate_bits(int axis_size) {
+        int bits = 0;
+        for (int last = axis_size - 1; last > 0; last >>= 1) ++bits;
+        return bits;
+    }
+
     godot::Array sand_snapshot(bool cull, int previous_rows) {
         // RGBA32F stores exact integers through 2^24. The pair of coordinates
         // per channel therefore fits for dimensions up to 4096 cells.
@@ -151,17 +157,20 @@ public:
         const int needed = (count + width - 1) / width;
         if (needed > 16384) return {};
         const int padded = (needed + 3) & ~3;
-        const int rows = count == 0 ? 0 : previous_rows >= needed && previous_rows <= 16384 &&
-            previous_rows <= padded + std::max(padded / 2, 4) ? previous_rows : padded;
+        int rows = padded;
+        if (count != 0 && previous_rows >= needed && previous_rows <= 16384 &&
+                previous_rows <= padded + std::max(padded / 2, 4))
+            rows = previous_rows;
+        constexpr I3 bits(coordinate_bits(nx), coordinate_bits(ny), coordinate_bits(nz));
         godot::PackedFloat32Array data;
         data.resize(rows * width * 4);
         float *cells = data.ptrw();
         const auto write_grain = [&](float *out, const Grain &grain, int index, int style) {
             const I3 current = decode(grain.position);
             const I3 previous = grain.moved == tick && grain.previous != grain.position ? decode(grain.previous) : current;
-            out[0] = float(current.x + nx * previous.x);
-            out[1] = float(current.y + ny * previous.y);
-            out[2] = float(current.z + nz * previous.z);
+            out[0] = float(current.x | (previous.x << bits.x));
+            out[1] = float(current.y | (previous.y << bits.y));
+            out[2] = float(current.z | (previous.z << bits.z));
             out[3] = float((hash(uint32_t(index)) & 255u) | (uint32_t(style) << 8));
         };
         const auto pack_sand = [&](int start, int end) {
@@ -190,6 +199,7 @@ public:
         result.push_back(width);
         result.push_back(rows);
         result.push_back(data.to_byte_array());
+        result.push_back(godot::Vector3i(bits.x, bits.y, bits.z));
         return result;
     }
 

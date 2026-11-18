@@ -3,7 +3,7 @@ render_mode skip_vertex_transform, cull_back, diffuse_burley, specular_schlick_g
 
 uniform sampler2D grain_state : filter_nearest, repeat_disable;
 uniform sampler2D grain_palette : filter_nearest, repeat_disable;
-uniform ivec3 grid_size;
+uniform ivec3 grid_shift;
 uniform float cell_size;
 uniform float interpolation;
 
@@ -16,8 +16,8 @@ void vertex() {
 	int color_index = int(grain.w);
 	int style = color_index >> 8;
 	int extent = 1 << (style & 3);
-	vec3 previous = vec3(encoded / grid_size);
-	vec3 current = vec3(encoded % grid_size);
+	vec3 previous = vec3(encoded >> grid_shift);
+	vec3 current = vec3(encoded & ((ivec3(1) << grid_shift) - ivec3(1)));
 	vec3 center = (mix(previous, current, interpolation) + vec3(float(extent) * 0.5)) * cell_size;
 	float size = float(extent) * cell_size * (extent == 1 ? 0.974 : 0.98);
 	// The batch is anchored at the voxel world's origin. Its instance slots
