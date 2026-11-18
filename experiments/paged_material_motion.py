@@ -142,6 +142,19 @@ def allocate_halo(boxes, bounds, halo):
     return directory, pages, origins, table[active].copy(), shape, totals
 
 
+def logical_hash(final, origins, slots, bounds):
+    """Hash mobile material independently of its physical atlas slot."""
+    by_page = final[slots]
+    mobile_page, mobile_cell = np.nonzero((by_page == 2) | (by_page == 3))
+    mobile_key = origins[mobile_page].astype(np.int64)
+    mobile_key[:, 0] += mobile_cell & 7
+    mobile_key[:, 1] += mobile_cell >> 6
+    mobile_key[:, 2] += (mobile_cell >> 3) & 7
+    mobile_key[:, 0] += bounds[0] * (mobile_key[:, 2] + bounds[2] * mobile_key[:, 1])
+    material_ids = by_page[mobile_page, mobile_cell]
+    return hashlib.sha256((4 * mobile_key[:, 0] + material_ids).tobytes()).hexdigest()
+
+
 def run(layout, bounds, halo, frames, use_graphs, trace):
     boxes = np.asarray(layout["boxes"], dtype=np.int32).reshape((-1, 7))
     if (np.any(boxes[:, :3] < 0) or np.any(boxes[:, 3:6] > bounds)
@@ -204,17 +217,6 @@ def run(layout, bounds, halo, frames, use_graphs, trace):
     sand, water, exchanges, edge = counts.numpy().sum(axis=0, dtype=np.int64)
     conserved = np.array_equal(before_counts, final_counts)
     static_errors = int(np.count_nonzero((pages == 1) != (final == 1)))
-    # Hash mobile material by logical cell coordinates, independent of the
-    # assigned page slots and of how many empty pages the halo allocated.
-    by_page = final[slots]
-    mobile_page, mobile_cell = np.nonzero((by_page == 2) | (by_page == 3))
-    mobile_key = origins[mobile_page].astype(np.int64)
-    mobile_key[:, 0] += mobile_cell & 7
-    mobile_key[:, 1] += mobile_cell >> 6
-    mobile_key[:, 2] += (mobile_cell >> 3) & 7
-    mobile_key[:, 0] += bounds[0] * (mobile_key[:, 2] + bounds[2] * mobile_key[:, 1])
-    material_ids = by_page[mobile_page, mobile_cell]
-    hashes = hashlib.sha256((4 * mobile_key[:, 0] + material_ids).tobytes())
     result = {
         "layout": layout["layout"], "halo_tiles": halo, "graphs": use_graphs, "updates": frames,
         "resident_pages": len(pages), "dispatched_pages": len(slots),
@@ -227,7 +229,7 @@ def run(layout, bounds, halo, frames, use_graphs, trace):
         "sand_crossings": int(sand), "water_crossings": int(water), "sand_water_swaps": int(exchanges),
         "unbacked_move_attempts": int(edge), "conserved": bool(conserved), "static_errors": static_errors,
         "material_count_delta": (final_counts - before_counts).tolist(),
-        "hash": hashes.hexdigest(),
+        "hash": logical_hash(final, origins, slots, bounds),
     }
     if trace:
         result["cuda_ms_after_warmup"] = [round(sample[0], 3) for sample in samples]

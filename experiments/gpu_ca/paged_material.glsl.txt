@@ -1,0 +1,82 @@
+#version 450
+layout(local_size_x = 128) in;
+
+layout(set = 0, binding = 0, std430) readonly buffer Directory { int directory[]; };
+layout(set = 0, binding = 1, std430) restrict buffer Materials { int atlas[]; };
+layout(set = 0, binding = 2, std430) readonly buffer Origins { ivec4 pages[]; };
+layout(set = 0, binding = 3, std430) readonly buffer Residency { int writable[]; };
+layout(set = 0, binding = 4, std430) restrict buffer Support { uint flags[]; };
+layout(push_constant, std430) uniform Params {
+    ivec4 shape_and_count;
+    ivec4 pass_axis_parity_width;
+    vec4 focus;
+};
+
+int address(ivec3 p) {
+    if (any(lessThan(p, ivec3(0))) || any(greaterThanEqual(p, shape_and_count.xyz * 8))) return -2;
+    ivec3 tile = p / 8;
+    int slot = directory[tile.x + shape_and_count.x * (tile.z + shape_and_count.z * tile.y)];
+    if (slot < 0) return slot;
+    ivec3 local = p & 7;
+    return slot * 512 + local.x + 8 * (local.z + 8 * local.y);
+}
+
+int material(int location) {
+    return location < 0 ? -1 - location : atlas[location];
+}
+
+bool preference(ivec3 p, int axis, int direction) {
+    vec3 delta = focus.xyz - vec3(p);
+    return delta[axis] * float(direction) > 0.5 && dot(delta, delta) < focus.w;
+}
+
+void record_support(uint invocation) {
+    if (invocation >= uint(shape_and_count.w) * 512u) return;
+    ivec4 page = pages[invocation >> 9];
+    int local = int(invocation & 511u);
+    ivec3 p = page.xyz + ivec3(local & 7, local >> 6, (local >> 3) & 7);
+    int below = material(address(p - ivec3(0, 1, 0)));
+    int above = material(address(p + ivec3(0, 1, 0)));
+    flags[page.w * 512 + local] = uint(below == 0) | (uint(above == 3) << 1);
+}
+
+void exchange_pairs(uint invocation) {
+    if (invocation >= uint(shape_and_count.w) * 256u) return;
+    ivec4 page = pages[invocation >> 8];
+    int cell = int(invocation & 255u);
+    int axis = pass_axis_parity_width.y;
+    int parity = pass_axis_parity_width.z;
+    ivec3 local = ivec3(cell & 7, cell >> 6, (cell >> 3) & 7);
+    if (axis == 0) local = ivec3((cell & 3) * 2 + parity, cell >> 5, (cell >> 2) & 7);
+    else if (axis == 1) local.y = local.y * 2 + parity;
+    else local = ivec3(cell & 7, cell >> 5, ((cell >> 3) & 3) * 2 + parity);
+    ivec3 p = page.xyz + local;
+    ivec3 q = p;
+    q[axis] += 1;
+    int a = page.w * 512 + local.x + 8 * (local.z + 8 * local.y);
+    int b = address(q);
+    if (b < 0 || writable[b / 512] == 0) return;
+    int left = atlas[a], right = atlas[b];
+    if (left == right) return;
+    bool swap = false;
+    if (left == 2 && (right == 0 || right == 3) && preference(p, axis, 1)) swap = true;
+    else if (right == 2 && (left == 0 || left == 3) && preference(q, axis, -1)) swap = true;
+    else if (axis == 1) swap = (left == 0 && (right == 2 || right == 3)) || (left == 3 && right == 2);
+    else if (left == 3 && right == 0) {
+        uint af = flags[a], bf = flags[b];
+        swap = (af & 1u) == 0u && ((bf & 1u) != 0u || ((af & 2u) != 0u && (bf & 2u) == 0u));
+    } else if (right == 3 && left == 0) {
+        uint af = flags[a], bf = flags[b];
+        swap = (bf & 1u) == 0u && ((af & 1u) != 0u || ((bf & 2u) != 0u && (af & 2u) == 0u));
+    }
+    if (swap) {
+        atlas[a] = right;
+        atlas[b] = left;
+    }
+}
+
+void main() {
+    uint invocation = gl_GlobalInvocationID.x + gl_GlobalInvocationID.y * uint(pass_axis_parity_width.w);
+    if (pass_axis_parity_width.x == 0) record_support(invocation);
+    else exchange_pairs(invocation);
+}
