@@ -1,6 +1,6 @@
 private:
     static constexpr float ambient_temperature = 18.f;
-    static constexpr int reaction_interval = 3 * refinement;
+    static constexpr int reaction_interval = simulation_hz / 10;
     static constexpr float wind_radius = 1.5f;
     static constexpr float water_pull_radius = 2.4f;
     static constexpr float vine_pull_radius = 1.2f;

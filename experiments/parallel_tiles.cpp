@@ -1,6 +1,7 @@
 #include <algorithm>
 #include <array>
 #include <chrono>
+#include <cmath>
 #include <condition_variable>
 #include <cstdint>
 #include <cstdlib>
@@ -80,8 +81,8 @@ private:
 
 struct Grain {
     int x, y, z;
-    float vx = 0.f, vy = 0.f;
-    float rx = 0.f, ry = 0.f;
+    float vx = 0.f, vy = 0.f, vz = 0.f;
+    float rx = 0.f, ry = 0.f, rz = 0.f;
 };
 
 struct World {
@@ -93,11 +94,50 @@ struct World {
     std::vector<std::vector<int>> seams;
     std::vector<int> order;
     std::vector<int> crossings;
+    std::vector<std::vector<int>> incoming;
+    std::vector<uint8_t> outgoing;
+    int migrations = 0;
+    bool persistent, pull;
+    static constexpr int release_tick = 48, ticks = 144;
+    static constexpr float radius = 5.5f, stiffness = 9.f;
+    static constexpr float restitution = .25f;
+
+    struct Stats {
+        double x = 0, y = 0, z = 0, vx = 0, vy = 0, vz = 0;
+        int wall = 0, floor = 0, rebound = 0;
+    };
+
+    Stats stats() const {
+        Stats result;
+        for (const auto &g : grains) {
+            result.x += (g.x + .5f) * cell + g.rx;
+            result.y += (g.y + .5f) * cell + g.ry;
+            result.z += (g.z + .5f) * cell + g.rz;
+            result.vx += g.vx;
+            result.vy += g.vy;
+            result.vz += g.vz;
+            result.wall += g.x == wall - 1;
+            result.floor += g.y == 1;
+            result.rebound += g.x == wall - 1 && g.vx < 0.f;
+        }
+        return result;
+    }
+
+    static float field(const Grain &g, int axis, int tick) {
+        if (tick >= release_tick) return 0.f;
+        const float a = 6.5f - (g.x + .5f) * cell;
+        const float b = 3.8f - (g.y + .5f) * cell;
+        const float c = (tick < 24 ? 2.25f : 4.65f) - (g.z + .5f) * cell;
+        if (a*a + b*b + c*c > radius*radius) return 0.f;
+        return stiffness * (axis == 0 ? a : axis == 1 ? b : c);
+    }
     double bin_ms = 0., inside_ms = 0., seam_ms = 0.;
     static int flat(int x, int y, int z) { return x + nx * (z + nz * y); }
     static int bin(const Grain &p) { return (p.x/tile) + (nx/tile) * ((p.z/tile)+(nz/tile)*(p.y/tile)); }
 
-    explicit World(int threads, bool dense) : bins((nx/tile)*(ny/tile)*(nz/tile)), seams(threads) {
+    explicit World(int threads, bool dense, bool keep_bins, bool use_pull)
+        : bins((nx/tile)*(ny/tile)*(nz/tile)), seams(threads),
+          incoming(bins.size()), outgoing(bins.size()), persistent(keep_bins), pull(use_pull) {
         for (int z = 0; z < nz; ++z)
             for (int x = 0; x < nx; ++x) occupancy[flat(x, 0, z)] = -1;
         for (int y = 1; y < ny; ++y)
@@ -108,25 +148,28 @@ struct World {
                     grains.push_back({x, y, z});
                     occupancy[flat(x, y, z)] = int(grains.size());
                 }
+        if (persistent) group_grains();
     }
 
     bool try_move(int id, int axis) {
         Grain &g = grains[id];
         const int old = flat(g.x, g.y, g.z);
-        float &v = axis == 0 ? g.vx : g.vy;
-        float &r = axis == 0 ? g.rx : g.ry;
+        float &v = axis == 0 ? g.vx : axis == 1 ? g.vy : g.vz;
+        float &r = axis == 0 ? g.rx : axis == 1 ? g.ry : g.rz;
+        int &coord = axis == 0 ? g.x : axis == 1 ? g.y : g.z;
         if (std::abs(r) < cell) return false;
         const int d = r > 0.f ? 1 : -1;
-        const int next = old + (axis == 0 ? d : d * nx * nz);
-        const int dest_coord = (axis == 0 ? g.x : g.y) + d;
-        if (dest_coord >= 0 && dest_coord < (axis == 0 ? nx : ny) && occupancy[next] == 0) {
+        const int next = old + d * (axis == 0 ? 1 : axis == 1 ? nx * nz : nx);
+        const int dest = coord + d;
+        const bool in_bounds = dest >= 0 && dest < (axis == 0 ? nx : axis == 1 ? ny : nz);
+        if (in_bounds && occupancy[next] == 0) {
             occupancy[old] = 0;
             occupancy[next] = id + 1;
-            if (axis == 0) g.x += d; else g.y += d;
+            coord = dest;
             r -= float(d) * cell;
             return true;
         }
-        v = 0.f;
+        v = pull && (!in_bounds || occupancy[next] < 0) ? -restitution * v : 0.f;
         r = 0.f;
         return false;
     }
@@ -134,16 +177,21 @@ struct World {
     void group_grains() {
         for (auto &b : bins) b.clear();
         for (int id = 0; id < int(grains.size()); ++id) bins[bin(grains[id])].push_back(id);
+        refresh_order();
+    }
+
+    void refresh_order() {
         order.clear();
         for (int i = 0; i < int(bins.size()); ++i) if (!bins[i].empty()) order.push_back(i);
     }
 
     int step(Pool &pool, int tick) {
         int seam_attempts = 0;
-        for (int axis = 1; axis >= 0; --axis) {
+        for (int sweep = 0; sweep < (pull ? 3 : 2); ++sweep) {
+            const int axis = sweep == 0 ? 1 : sweep == 1 ? 0 : 2;
             const auto start = Clock::now();
             // A seam move during the previous sweep may change tile ownership.
-            group_grains();
+            if (!persistent) group_grains();
             const auto grouped = Clock::now();
             for (auto &s : seams) s.clear();
             pool.run([&](int worker) {
@@ -151,18 +199,17 @@ struct World {
                 for (size_t i = worker; i < order.size(); i += pool.count) {
                     for (int id : bins[order[i]]) {
                         Grain &g = grains[id];
-                        if (axis == 1) {
-                            g.vy = std::max(g.vy - 9.81f * dt, -cell / dt);
-                            g.ry += g.vy * dt;
-                        } else {
-                            g.vx = std::min(g.vx + (tick < 75 ? 7.f : 0.f) * dt, cell / dt);
-                            g.rx += g.vx * dt;
-                        }
-                        const float r = axis == 0 ? g.rx : g.ry;
-                        const int coord = axis == 0 ? g.x : g.y;
+                        float &v = axis == 0 ? g.vx : axis == 1 ? g.vy : g.vz;
+                        float &r = axis == 0 ? g.rx : axis == 1 ? g.ry : g.rz;
+                        float acceleration = axis == 1 ? -9.81f : 0.f;
+                        if (pull) acceleration += field(g, axis, tick);
+                        else if (axis == 0 && tick < 75) acceleration = 7.f;
+                        v = std::clamp(v + acceleration * dt, -cell / dt, cell / dt);
+                        r += v * dt;
+                        const int coord = axis == 0 ? g.x : axis == 1 ? g.y : g.z;
                         if (std::abs(r) < cell) continue;
                         const int dest = coord + (r > 0.f ? 1 : -1);
-                        if (dest >= 0 && dest < (axis == 0 ? nx : ny) && dest / tile == coord / tile) try_move(id, axis);
+                        if (dest >= 0 && dest < (axis == 0 ? nx : axis == 1 ? ny : nz) && dest / tile == coord / tile) try_move(id, axis);
                         else seam.push_back(id);
                     }
                 }
@@ -171,12 +218,41 @@ struct World {
             crossings.clear();
             for (const auto &items : seams) crossings.insert(crossings.end(), items.begin(), items.end());
             std::sort(crossings.begin(), crossings.end());
-            for (int id : crossings) try_move(id, axis);
+            for (int id : crossings) {
+                const int from = bin(grains[id]);
+                if (!try_move(id, axis)) continue;
+                const int to = bin(grains[id]);
+                if (persistent && from != to) {
+                    outgoing[from] = 1;
+                    incoming[to].push_back(id);
+                    ++migrations;
+                }
+            }
+            const auto resolved = Clock::now();
+            if (persistent) {
+                for (int i = 0; i < int(bins.size()); ++i) {
+                    auto &b = bins[i];
+                    if (outgoing[i]) {
+                        b.erase(std::remove_if(b.begin(), b.end(), [&](int id) {
+                            return bin(grains[id]) != i;
+                        }), b.end());
+                        outgoing[i] = 0;
+                    }
+                    auto &arrivals = incoming[i];
+                    if (!arrivals.empty()) {
+                        const auto middle = b.size();
+                        b.insert(b.end(), arrivals.begin(), arrivals.end());
+                        std::inplace_merge(b.begin(), b.begin() + middle, b.end());
+                        arrivals.clear();
+                    }
+                }
+                refresh_order();
+            }
             seam_attempts += int(crossings.size());
             if (tick >= 15) {
-                bin_ms += std::chrono::duration<double, std::milli>(grouped - start).count();
+                bin_ms += std::chrono::duration<double, std::milli>(grouped - start + (Clock::now() - resolved)).count();
                 inside_ms += std::chrono::duration<double, std::milli>(solved - grouped).count();
-                seam_ms += std::chrono::duration<double, std::milli>(Clock::now() - solved).count();
+                seam_ms += std::chrono::duration<double, std::milli>(resolved - solved).count();
             }
         }
         return seam_attempts;
@@ -186,14 +262,22 @@ struct World {
 int main(int argc, char **argv) {
     const int threads = argc > 1 ? std::clamp(std::atoi(argv[1]), 1, 32) : 1;
     const bool dense = argc > 2 && std::string(argv[2]) == "dense";
-    World world(threads, dense);
+    const bool persistent = argc > 3 && std::string(argv[3]) == "persistent";
+    const bool pull = argc > 4 && std::string(argv[4]) == "pull";
+    World world(threads, dense, persistent, pull);
     Pool pool(threads);
     std::vector<double> samples;
     int seam_attempts = 0;
-    for (int tick = 0; tick < 180; ++tick) {
+    const int ticks = pull ? World::ticks : 180;
+    const int batch = pull ? 2 : 1;
+    std::array<World::Stats, 5> checkpoints;
+    checkpoints[0] = world.stats();
+    for (int tick = 0; tick < ticks; tick += batch) {
         const auto start = Clock::now();
-        seam_attempts += world.step(pool, tick);
-        if (tick >= 15) samples.push_back(std::chrono::duration<double, std::milli>(Clock::now()-start).count());
+        for (int i = 0; i < batch; ++i) seam_attempts += world.step(pool, tick + i);
+        if (tick >= 16) samples.push_back(std::chrono::duration<double, std::milli>(Clock::now()-start).count());
+        if (pull && (tick + batch) % 36 == 0)
+            checkpoints[(tick + batch) / 36] = world.stats();
     }
     std::sort(samples.begin(), samples.end());
     uint64_t hash = 14695981039346656037ull;
@@ -209,14 +293,16 @@ int main(int argc, char **argv) {
         if (g.x == World::wall - 1) ++wall_contacts;
         append(uint64_t(cell));
         append(uint64_t(id));
-        for (float component : {g.vx, g.vy, g.rx, g.ry}) {
+        for (float component : {g.vx, g.vy, g.vz, g.rx, g.ry, g.rz}) {
             uint32_t bits;
             std::memcpy(&bits, &component, sizeof(bits));
             append(bits);
         }
     }
     std::cout << std::fixed << std::setprecision(3)
-        << "{\"threads\":" << threads << ",\"grains\":" << world.grains.size()
+        << "{\"threads\":" << threads << ",\"mode\":\"" << (persistent ? "persistent" : "regroup") << "\""
+        << ",\"fixture\":\"" << (pull ? "pull" : "push") << "\""
+        << ",\"grains\":" << world.grains.size()
         << ",\"p50_ms\":" << samples[samples.size()/2]
         << ",\"p95_ms\":" << samples[size_t(samples.size()*.95)]
         << ",\"bin_mean_ms\":" << world.bin_ms / samples.size()
@@ -224,6 +310,20 @@ int main(int argc, char **argv) {
         << ",\"seam_mean_ms\":" << world.seam_ms / samples.size()
         << ",\"seam_attempts\":" << seam_attempts << ",\"occupancy_errors\":" << bad
         << ",\"through_wall\":" << through_wall << ",\"wall_contacts\":" << wall_contacts
-        << ",\"hash\":\"" << hash << "\"}\n";
+        << ",\"migrations\":" << world.migrations
+        << ",\"hash\":\"" << hash << "\"";
+    if (pull) {
+        std::cout << ",\"checkpoints\":[";
+        const double n = double(world.grains.size());
+        for (size_t i = 0; i < checkpoints.size(); ++i) {
+            const auto &c = checkpoints[i];
+            if (i) std::cout << ',';
+            std::cout << "[" << c.x/n << ',' << c.y/n << ',' << c.z/n << ','
+                      << c.vx/n << ',' << c.vy/n << ',' << c.vz/n << ','
+                      << c.wall << ',' << c.floor << ',' << c.rebound << "]";
+        }
+        std::cout << ']';
+    }
+    std::cout << "}\n";
     return bad || through_wall || occupancy_count != int(world.grains.size()) || (dense && !wall_contacts);
 }

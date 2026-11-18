@@ -8,7 +8,7 @@ private:
     static constexpr int humidity_size = humidity_nx * humidity_ny * humidity_nz;
     static constexpr float humidity_cell = humidity_width * scale;
     static constexpr float reference_volume = refinement * refinement * refinement / 64.f;
-    static constexpr int humidity_second = 30 * refinement;
+    static constexpr int humidity_second = simulation_hz;
     static constexpr int humidity_recovery_delay = 6 * humidity_second;
 
     struct HumidityCell {

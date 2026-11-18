@@ -33,10 +33,24 @@ class World {
     static constexpr int chunk_count = bx * by * bz;
     static_assert(nx % block == 0 && ny % block == 0 && nz % block == 0);
     static constexpr float scale = 0.18f / refinement;
-    static constexpr float dt = 1.f / (30.f * refinement);
-    static constexpr float maximum_particle_speed = scale / dt;
-    static constexpr int max_faces_per_axis = 6;
-    static constexpr float maximum_swept_speed = maximum_particle_speed * max_faces_per_axis;
+    static constexpr int reference_hz = 30 * refinement;
+#ifdef SOMEVOXEL_EXPERIMENTAL_SIMULATION_HZ
+    static constexpr int simulation_hz = SOMEVOXEL_EXPERIMENTAL_SIMULATION_HZ;
+#else
+    static constexpr int simulation_hz = reference_hz;
+#endif
+#ifdef SOMEVOXEL_EXPERIMENTAL_WATER_HZ
+    static constexpr int bulk_water_hz = SOMEVOXEL_EXPERIMENTAL_WATER_HZ;
+#else
+    static constexpr int bulk_water_hz = refinement < 4 ? simulation_hz : simulation_hz / 2;
+#endif
+    static_assert(simulation_hz >= 60 && simulation_hz % 30 == 0);
+    static_assert(bulk_water_hz > 0 && simulation_hz % bulk_water_hz == 0 && bulk_water_hz % 15 == 0);
+    static constexpr float dt = 1.f / simulation_hz;
+    static constexpr float maximum_particle_speed = scale / (1.f / reference_hz);
+    static constexpr int reference_faces_per_axis = 6;
+    static constexpr int max_faces_per_axis = (reference_faces_per_axis * reference_hz + simulation_hz - 1) / simulation_hz;
+    static constexpr float maximum_swept_speed = maximum_particle_speed * reference_faces_per_axis;
     static constexpr float gravity = 13.f;
     static constexpr float sand_density = 1600.f;
     static constexpr int sand_packing_percent = 125;
@@ -895,6 +909,17 @@ private:
         return {sand_density, kind == Gravel ? 1.85f : 2.40f, 0.83f};
     }
 
+    static float step_ground_retention(Kind kind, float retention) {
+        if constexpr (simulation_hz == reference_hz) return retention;
+        static const auto coefficients = [] {
+            std::array<float, Char + 1> values{};
+            for (int i = 0; i <= Char; ++i)
+                values[i] = std::pow(granular_material(Kind(i)).ground_retention, float(reference_hz) / simulation_hz);
+            return values;
+        }();
+        return coefficients[kind];
+    }
+
     static float particle_mass(Kind kind, int extent) {
         const float width = extent * scale;
         return granular_material(kind).density * width * width * width;
@@ -1060,8 +1085,8 @@ private:
         if (!crosses_face) return {origin, origin};
 
         I3 position = origin;
-        // Ordinary motion crosses at most one face per axis. Fast casts may
-        // cross up to six, plus a retained face at the start of the step.
+        // The bound covers every face reached at the supported maximum
+        // speed, plus a retained face at the start of the step.
         for (int face = 0; face < 3 * (max_faces_per_axis + 1); ++face) {
             int axis = 0;
             if (crossing.y < crossing[axis]) axis = 1;
@@ -1191,8 +1216,9 @@ private:
                     }
                 }
                 if (slope == I3()) {
-                    grain.velocity.x *= material.ground_retention;
-                    grain.velocity.z *= material.ground_retention;
+                    const float retention = step_ground_retention(kind, material.ground_retention);
+                    grain.velocity.x *= retention;
+                    grain.velocity.z *= retention;
                 }
             }
         }

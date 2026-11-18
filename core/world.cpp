@@ -170,7 +170,16 @@ void World::step() {
     ++voxel_stamp;
     // Separate update rates retain responsive fine sand without evaluating
     // the dense reservoir's connected water head twice per rendered frame.
-    water_tick = refinement < 4 || (tick & 1u) == 0;
+    constexpr int water_interval = simulation_hz / bulk_water_hz;
+    water_tick = tick % water_interval == 0;
+    uint32_t sweep_phase = tick;
+#ifdef SOMEVOXEL_EXPERIMENTAL_WATER_SWEEP_PHASE
+    // A fixed stride can sample the same orientation on every water tick.
+    // This probe advances the shared sweep using the water tick index.
+    if (water_tick) sweep_phase = tick / water_interval;
+#endif
+    const bool reverse_x = (sweep_phase & 1u) != 0;
+    const bool reverse_z = (sweep_phase & 2u) != 0;
     const bool defer_bulk_water = !water_tick && !pulling_water && !winding;
     moved_grains = 0;
     moved_gravel = 0;
@@ -189,9 +198,9 @@ void World::step() {
     for (int cy = 0; cy < by; ++cy) {
         int count = 0;
         for (int zi = 0; zi < bz; ++zi) {
-            const int cz = tick & 2u ? bz - 1 - zi : zi;
+            const int cz = reverse_z ? bz - 1 - zi : zi;
             for (int xi = 0; xi < bx; ++xi) {
-                const int cx = tick & 1u ? bx - 1 - xi : xi;
+                const int cx = reverse_x ? bx - 1 - xi : xi;
                 const I3 chunk(cx, cy, cz);
                 if (awake[chunk_id(chunk)]) slab_chunks[count++] = chunk;
             }
@@ -201,7 +210,7 @@ void World::step() {
             for (int entry = 0; entry < count; ++entry) {
                 const I3 chunk = slab_chunks[entry];
                 for (int z = 0; z < block; ++z) {
-                    const I3 row(chunk.x * block, y, chunk.z * block + (tick & 2u ? block - 1 - z : z));
+                    const I3 row(chunk.x * block, y, chunk.z * block + (reverse_z ? block - 1 - z : z));
                     const int row_id = flat(row) / block;
                     unsigned mask = mobile_rows[row_id];
                     if (defer_bulk_water && bulk_water_rows[row_id]) {
@@ -211,7 +220,7 @@ void World::step() {
                         mask &= ~unsigned(bulk_water_rows[row_id]);
                     }
                     while (mask) {
-                    const int x = next_row_cell(mask, (tick & 1u) != 0);
+                        const int x = next_row_cell(mask, reverse_x);
                         mask &= ~(1u << x);
                         update_voxel({row.x + x, row.y, row.z});
                     }

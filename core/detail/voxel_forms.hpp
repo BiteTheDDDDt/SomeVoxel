@@ -65,7 +65,7 @@ private:
 
     void step_whip_pulse() {
         if (!whip_pulse.moving) return;
-        constexpr int substeps = std::max(1, 4 / refinement);
+        constexpr int substeps = (120 + simulation_hz - 1) / simulation_hz;
         constexpr float timestep = dt / substeps;
         float largest_motion = 0.f;
         for (int step = 0; step < substeps; ++step) {
@@ -252,7 +252,7 @@ private:
         step_whip_pulse();
         if (particle_form.style != NoForm && tick >= next_form_recruit) {
             recruit_form_particles();
-            next_form_recruit = tick + std::max(1u, uint32_t(refinement * 2));
+            next_form_recruit = tick + uint32_t(simulation_hz / 15);
         }
         for (auto item = form_motion.begin(); item != form_motion.end();) {
             wake_near(decode(item->first), awake);
@@ -301,7 +301,7 @@ private:
             const float profile = motion.style == BladeForm ? 0.72f + 1.18f * slice : whip ? 0.5f + 0.65f * motion.anchor.x : 1.f;
             const float response = launched ? 0.055f : lashing ? 0.14f : 0.18f;
             hit_target->pending_damage += response * particle_mass(material, 1) * speed * speed * profile;
-            motion.last_contact = tick + std::max(1u, uint32_t(refinement * 5));
+            motion.last_contact = tick + uint32_t(simulation_hz / 30 * 5);
         }
         return true;
     }
@@ -613,7 +613,7 @@ public:
             Grain &grain = particle_form.material == Water ? liquid_particle(i) : grains[voxels[i].occupant];
             grain.velocity += impulse / particle_mass(particle_form.material, grain);
             motion.forward = direction;
-            motion.expires = tick + std::max(1u, uint32_t(refinement * 24));
+            motion.expires = tick + uint32_t(simulation_hz / 30 * 24);
             ++launched;
         }
         if (launched > 0) release_held_form();

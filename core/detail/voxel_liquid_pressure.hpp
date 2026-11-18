@@ -4,7 +4,7 @@ private:
         int depth = 0;
     };
 
-    static constexpr uint32_t pressure_interval = 2 * refinement;
+    static constexpr uint32_t pressure_interval = simulation_hz / 15;
     static constexpr int pressure_transfer_limit = 48;
     static constexpr int pressure_face_budget = 2048;
     using LiquidHead = std::conditional_t<(ny <= 255), uint8_t, uint16_t>;
