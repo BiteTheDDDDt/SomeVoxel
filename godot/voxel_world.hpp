@@ -141,6 +141,7 @@ public:
         result["refinement"] = state.refinement;
         result["cell_size"] = state.cell_size;
         result["step_seconds"] = state.step_seconds;
+        result["bulk_water_hz"] = state.bulk_water_hz;
         result["voxel_bytes"] = state.voxel_bytes;
         result["grain_bytes"] = state.grain_bytes;
         result["dense_grid_bytes"] = state.dense_grid_bytes;

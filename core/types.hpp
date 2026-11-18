@@ -11,6 +11,7 @@ struct WorldStats {
     int64_t refinement = 0;
     float cell_size = 0;
     float step_seconds = 0;
+    int64_t bulk_water_hz = 0;
     int64_t voxel_bytes = 0;
     int64_t grain_bytes = 0;
     int64_t dense_grid_bytes = 0;

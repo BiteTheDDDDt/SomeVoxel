@@ -34,8 +34,11 @@ The water-only fixture can be reflected along X without changing the tank volume
 | 180 / 60 Hz | Simulation tick | 347.8 L | 345.0 L |
 | 180 / 90 Hz | Bulk-water tick on water sweeps | 547.9 L | 543.7 L |
 | 120 / 60 Hz | Bulk-water tick on water sweeps | 349.2 L | 346.2 L |
+| 120 / 90 Hz | Bulk-water tick on water sweeps | 545.7 L | 549.2 L |
 
 The rotating phase reduced the mirrored difference at 180/90 Hz to under 1% of the pair's average. This fixture does not establish the physical target flow rate. Slowing water to 60 Hz still reduced discharge by about 36% between the rotating-phase profiles. Their mixed-fixture P95 timings were 51.7 and 37.4–39.3 ms, respectively. Both held material inventories and registered sand impacts. Use `-DSOMEVOXEL_EXPERIMENTAL_WATER_SWEEP_PHASE=ON` to reproduce.
+
+At 120/90 Hz, a cumulative schedule makes three water updates for every four engine ticks. Keeping the water rate at 90 Hz kept the mirrored tests within 1% of the 180/90 Hz rotating-phase results. The mixed fixture discharged 541.6 L and recorded a 1.350 N·s peak impact.
 
 ## CPU parallel water-head reconstruction
 

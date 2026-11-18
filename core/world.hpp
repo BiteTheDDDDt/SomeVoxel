@@ -45,7 +45,7 @@ class World {
     static constexpr int bulk_water_hz = refinement < 4 ? simulation_hz : simulation_hz / 2;
 #endif
     static_assert(simulation_hz >= 60 && simulation_hz % 30 == 0);
-    static_assert(bulk_water_hz > 0 && simulation_hz % bulk_water_hz == 0 && bulk_water_hz % 15 == 0);
+    static_assert(bulk_water_hz > 0 && bulk_water_hz <= simulation_hz && bulk_water_hz % 15 == 0);
     static constexpr float dt = 1.f / simulation_hz;
     static constexpr float maximum_particle_speed = scale / (1.f / reference_hz);
     static constexpr int reference_faces_per_axis = 6;
@@ -2006,6 +2006,7 @@ public:
         data.refinement = refinement;
         data.cell_size = scale;
         data.step_seconds = dt;
+        data.bulk_water_hz = bulk_water_hz;
         data.voxel_bytes = sizeof(Voxel);
         data.grain_bytes = sizeof(Grain);
         data.dense_grid_bytes = voxels.size() * sizeof(Voxel) + mobile_rows.size() + bulk_water_rows.size() +

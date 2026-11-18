@@ -170,13 +170,15 @@ void World::step() {
     ++voxel_stamp;
     // Separate update rates retain responsive fine sand without evaluating
     // the dense reservoir's connected water head twice per rendered frame.
-    constexpr int water_interval = simulation_hz / bulk_water_hz;
-    water_tick = tick % water_interval == 0;
+    // A water update occurs when the cumulative schedule crosses a whole tick.
+    // This also supports ratios such as 90 updates in 120 simulation ticks.
+    const uint64_t water_phase = uint64_t(tick) * bulk_water_hz;
+    water_tick = water_phase % simulation_hz < bulk_water_hz;
     uint32_t sweep_phase = tick;
 #ifdef SOMEVOXEL_EXPERIMENTAL_WATER_SWEEP_PHASE
     // A fixed stride can sample the same orientation on every water tick.
     // This probe advances the shared sweep using the water tick index.
-    if (water_tick) sweep_phase = tick / water_interval;
+    if (water_tick) sweep_phase = uint32_t(water_phase / simulation_hz);
 #endif
     const bool reverse_x = (sweep_phase & 1u) != 0;
     const bool reverse_z = (sweep_phase & 2u) != 0;
