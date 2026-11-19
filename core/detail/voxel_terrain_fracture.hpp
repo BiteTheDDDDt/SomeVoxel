@@ -170,8 +170,48 @@ private:
         return (((from.x ^ (phase >> 1)) | (from.y ^ phase) | (from.z ^ (phase >> 2))) & 1) == 0;
     }
 
+    float sample_converging_sand_pressure(I3 from) const {
+        // Estimate confinement within the loaded core of the field. The
+        // wider attraction range still transports grains into this region.
+        constexpr float depth = 0.18f;
+        constexpr int cells = int(depth / scale + 0.5f);
+        constexpr float mass_per_area = sand_density * depth;
+        const V3 offset_from_focus = center(from) - field;
+        const float span = 0.32f * cast_radius_scale;
+        const float coverage = 1.f - offset_from_focus.length_squared() / (span * span);
+        if (coverage <= 0.f) return 0.f;
+        const float reach = granular_material(Sand).attraction_range * cast_radius_scale;
+        float best = sand_yield_pressure;
+        for (int axis = 0; axis < 3; ++axis) {
+            if (std::abs(offset_from_focus[axis]) >= depth) continue;
+            float opposing[2]{};
+            for (int side = 0; side < 2; ++side) {
+                const int direction = 2 * side - 1;
+                I3 offset;
+                offset[axis] = direction;
+                I3 endpoint = from;
+                for (int step = 0; step < cells; ++step) {
+                    if (kind_at(endpoint + offset) != Sand) break;
+                    endpoint += offset;
+                }
+                if (endpoint == from) break;
+                const V3 displacement = field - center(endpoint);
+                if (displacement[axis] * direction >= 0.f) break;
+                const float response = free_sand_pull_response(displacement.length_squared());
+                // Damping dissipates motion. Estimate sustained pressure
+                // from the elastic load carried by the connected grains.
+                opposing[side] = -direction *
+                    pull_acceleration(displacement, {}, reach, response, free_pull_stiffness, free_pull_damping)[axis];
+            }
+            const float pressure = mass_per_area * coverage * std::min(opposing[0], opposing[1]);
+            best = std::max(best, pressure);
+        }
+        return best;
+    }
+
     template <typename Fits>
-    void sample_bearing_contact(const Grain &grain, I3 from, Kind kind, V3 acceleration, const Fits &fits) {
+    void sample_bearing_contact(const Grain &grain, I3 from, Kind kind, V3 acceleration, const Fits &fits,
+            bool freely_pulled = false) {
         if (kind != Sand && kind != Gravel && kind != Rock) return;
         if (kind == Sand) {
             if (voxels[grain.position].formed) {
@@ -180,6 +220,10 @@ private:
                 const int corner = int(tick & 1u);
                 if (((from.x ^ corner) | (from.y ^ corner) | (from.z ^ corner)) & 1) return;
             }
+        }
+        if (freely_pulled && kind == Sand) {
+            const float pressure = sample_converging_sand_pressure(from);
+            if (pressure > sand_yield_pressure) record_contact_pressure(from, pressure);
         }
         // One physical bearing layer approximates the load carried by
         // neighboring grains. A rigid packet uses its mass and face area.
@@ -205,6 +249,7 @@ private:
                 if (fits(neighbor, &obstacle) || obstacle < 0) continue;
                 const Kind surface = voxels[obstacle].kind;
                 const bool fixed = kind == Sand && retains_grain_face(obstacle);
+                if (freely_pulled && !fixed) continue;
                 if (surface != Sand && !(kind == Sand && (surface == Gravel || fixed))) continue;
                 const float pressure = (fixed || kind != Sand ? applied : relative) * direction;
                 if (pressure > best) {

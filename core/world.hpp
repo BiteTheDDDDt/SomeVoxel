@@ -1375,13 +1375,9 @@ private:
             const float reach = material.attraction_range * cast_radius_scale;
             if (offset.length_squared() < reach * reach) {
                 float response = sand_density / (material.density * density_ratio * (1.f + 0.065f * (grain.extent - 1)));
-                if (charge_gather > 0.f && (kind == Sand || kind == Gravel)) {
-                    const float focus = free_sand_focus_reach();
-                    const float falloff = std::clamp(2.f - offset.length_squared() / (focus * focus), 0.f, 1.f);
-                    response *= 1.f + 2.2f * charge_gather * falloff;
-                }
+                if (kind == Sand || kind == Gravel) response *= free_sand_pull_response(offset.length_squared());
                 attracted = true;
-                return pull_acceleration(offset, grain.velocity, reach, response, 94.f, 13.f);
+                return pull_acceleration(offset, grain.velocity, reach, response, free_pull_stiffness, free_pull_damping);
             }
         }
         return {};
@@ -1408,7 +1404,7 @@ private:
         acceleration += field_drive(grain, from, kind, form, attracted);
         acceleration += wind_drive(grain, from, kind);
         if (kind != Sand || !form || form->expires != 0)
-            sample_bearing_contact(grain, from, kind, acceleration, fits);
+            sample_bearing_contact(grain, from, kind, acceleration, fits, attracted && !form && kind == Sand);
         if (kind == Sand && !form && airborne_earth_ejecta.empty() && step_enclosed_sand(grain, from, acceleration, attracted))
             return {from, from};
         I3 slope;

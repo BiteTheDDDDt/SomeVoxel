@@ -434,6 +434,16 @@ private:
 
     float free_sand_focus_reach() const { return std::clamp(0.82f * cast_radius_scale, 0.18f, 1.18f); }
 
+    static constexpr float free_pull_stiffness = 94.f;
+    static constexpr float free_pull_damping = 13.f;
+
+    float free_sand_pull_response(float distance_squared) const {
+        if (charge_gather <= 0.f) return 1.f;
+        const float reach = free_sand_focus_reach();
+        const float falloff = std::clamp(2.f - distance_squared / (reach * reach), 0.f, 1.f);
+        return 1.f + 2.2f * charge_gather * falloff;
+    }
+
     static float free_sand_focus_distance_squared(V3 point, V3 position) {
         V3 offset = point - position;
         offset.y *= 1.4f;
