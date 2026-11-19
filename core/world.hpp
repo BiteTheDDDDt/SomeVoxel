@@ -1365,8 +1365,9 @@ private:
             const V3 position = particle_center(from, grain.extent) + grain.travel;
             const V3 offset = form_destination(*form) - position;
             const bool lash = form->style == WhipForm && whip_is_lashing();
-            const float response = form_body_speed(grain, particle_form.strength) * (lash ? 2.2f : 1.f);
-            const float gather = 1.7f * form_charge_gather();
+            const float response = form_body_speed(grain, particle_form.strength * particle_form.response_scale) *
+                (lash ? 2.2f : 1.f);
+            const float gather = form_confinement();
             V3 spring = offset;
             if (gather > 0.f) {
                 V3 inward = particle_form.point - position;
@@ -2049,6 +2050,7 @@ private:
             const int cell = candidate.second;
             const I3 p = decode(cell);
             bool full = true;
+            int pores = 0;
             int mass_units = 0;
             int held_cells = 0;
             V3 held_anchor;
@@ -2066,6 +2068,10 @@ private:
             each_cube(cell, extent, [&](int i) {
                 if (!full) return;
                 const Voxel &v = voxels[i];
+                if (extent == 2 && v.kind == Empty && !body_at(i)) {
+                    full = ++pores <= 2;
+                    return;
+                }
                 if (v.kind == Sand) {
                     ++mass_units;
                     momentum += grains[v.occupant].velocity;

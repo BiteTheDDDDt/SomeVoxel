@@ -10,6 +10,7 @@ private:
         FormStyle style = NoForm;
         float radius = 0.f;
         float strength = 1.f;
+        float response_scale = 1.f;
     } particle_form;
 
     static constexpr int whip_node_count = 10;
@@ -28,6 +29,7 @@ private:
     };
 
     static constexpr size_t form_motion_limit = 1600;
+    static constexpr int geometric_form_cell_limit = 620;
     std::unordered_map<int, FormMotion> form_motion;
     std::unordered_map<int, FormTarget> form_targets;
     std::vector<std::pair<float, int>> form_candidates;
@@ -44,6 +46,17 @@ private:
             std::max(0.062f, 0.105f * radius), std::max(0.047f, 0.052f * radius));
         const float width = std::max(0.11f, 0.21f * radius);
         return {width, width, width};
+    }
+
+    static float form_representation_scale(FormStyle style, V3 half) {
+        if (style == WhipForm || scale >= 0.045f) return 1.f;
+        const float desired = 4.18879f * 0.48f * half.x * half.y * half.z;
+        constexpr float reference_volume = geometric_form_cell_limit * 0.045f * 0.045f * 0.045f;
+        constexpr float available_volume = geometric_form_cell_limit * scale * scale * scale;
+        const float target_volume = std::min(desired, reference_volume);
+        // Preserve represented fill at fine resolutions without increasing
+        // the number of active motion records.
+        return std::cbrt(std::min(1.f, available_volume / target_volume));
     }
 
     static float form_random(uint32_t seed) { return float(hash(seed) & 0xffffu) / 65535.f; }
@@ -108,8 +121,10 @@ private:
         return target;
     }
 
-    float form_charge_gather() const {
-        return particle_form.style == ShotForm || particle_form.style == BladeForm ? charge_gather : 0.f;
+    float form_confinement() const {
+        if (particle_form.style != ShotForm && particle_form.style != BladeForm) return 0.f;
+        const float held = std::max(0.f, particle_form.strength - 1.f) / (max_cast_strength - 1.f);
+        return 1.7f * std::max(held, charge_gather);
     }
 
     V3 form_destination(const FormMotion &motion) const {
@@ -126,7 +141,7 @@ private:
         }
         const float width = 4.18879f * (particle_form.half.x / scale) * (particle_form.half.y / scale)
             * (particle_form.half.z / scale);
-        return std::clamp(int(width * 0.48f), 12, 620);
+        return std::clamp(int(width * 0.48f), 12, geometric_form_cell_limit);
     }
 
     void reset_particle_forms() {
@@ -578,8 +593,13 @@ public:
         const V3 horizontal = V3(0.f, 1.f, 0.f).cross(axis);
         const V3 right = horizontal.length_squared() > 0.0025f ? horizontal.normalized() : V3(1.f, 0.f, 0.f);
         const bool shrinking = radius < particle_form.radius;
-        particle_form = {point, axis, right, axis.cross(right).normalized(), form_half_extents(FormStyle(form), radius),
-            handle, Kind(material), FormStyle(form), radius, std::clamp(strength, 0.1f, max_cast_strength)};
+        const V3 half = form_half_extents(FormStyle(form), radius);
+        const float representation = form_representation_scale(FormStyle(form), half);
+        // A smaller envelope has a shorter absolute displacement for the
+        // same strain. Normalize the spring response to that displacement.
+        particle_form = {point, axis, right, axis.cross(right).normalized(), half * representation,
+            handle, Kind(material), FormStyle(form), radius, std::clamp(strength, 0.1f, max_cast_strength),
+            1.f / representation};
         if (shrinking) trim_held_form();
     }
 

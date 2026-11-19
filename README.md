@@ -22,6 +22,8 @@ Sustained compression samples the strongest supported face before the motion sol
 
 Sand forms can recruit loose grains and packed bodies. Packed bodies consume their occupied volume in the form budget and retain one binding at their anchor. Packing a region mostly held by a form transfers its binding to the new body. Fracture passes the binding to the resulting pieces within the motion-record budget.
 
+Geometric forms shrink their target envelope at finer cell sizes when the active volume budget is smaller. The spring response is normalized by the envelope scale. Stronger holds add inward confinement through the same contact path as charge. A small porous packing region may consume nearby donor grains to fill its voids if it has accumulated the additional work.
+
 Fresh Windows, Linux and macOS builds default to four workers for water-head rebuilds and sand rendering. At refinement 18 and higher, water-head rebuilds default to eight. Override `SOMEVOXEL_PARALLEL_WATER_WORKERS` and `SOMEVOXEL_PARALLEL_RENDER_WORKERS` at configure time, or set either to an empty string for its serial implementation. At runtime, `set_water_workers(n)` selects a limit per world, with 0 for all detected logical processors and −1 for the build default. `water_worker_count()` includes the calling thread. Pressure checks can reuse the packed component surfaces until the water topology changes. When a connected surface can discharge, the solver uses the original sequential parcel routes.
 
 Enable `set_sand_sweep_profiling(true)` to collect the latest step's row visits, loose-sand integration count, face attempts, face crossings, contact count and sweep time. Read the counters with `sand_sweep_stats()`. The Godot bridge returns the same fields as a dictionary.

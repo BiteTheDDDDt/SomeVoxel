@@ -151,8 +151,9 @@ private:
         constexpr float closure_volume = 2.f * scale * scale * scale;
         constexpr float max_closure_rate = 3.f;
         const float threshold = sand_compaction_work(2, 2);
+        const float porous_threshold = sand_compaction_work(2, 4);
         const float duration = (sample_gap == 2 && history.work > 0.f ? 2.f : 1.f) * dt;
-        history.work = std::min(threshold,
+        history.work = std::min(porous_threshold,
             history.work + (pressure - sand_yield_pressure) * closure_volume * max_closure_rate * duration);
         if (history.work >= threshold && tick >= history.retry_after && compaction_jobs.size() < 64) {
             compaction_jobs.emplace_back(id, history.work);
