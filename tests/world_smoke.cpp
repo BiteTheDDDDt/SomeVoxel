@@ -200,8 +200,9 @@ static bool compression_below_focus(somevoxel::World &world) {
     for (const bool shaped : {false, true}) {
         if (!world.load_boxes(layout, std::size(layout))) return false;
         const auto initial = world.status();
-        world.set_cast_profile(1.f, 5.f);
-        if (shaped) world.set_particle_form(focus, {1, 0, 0}, World::Sand, 1, 1.5f, 5.f);
+        const float strength = shaped ? 3.f : 5.f;
+        world.set_cast_profile(1.f, strength);
+        if (shaped) world.set_particle_form(focus, {1, 0, 0}, World::Sand, 1, 1.5f, strength);
         else world.set_field(focus, true);
         world.set_charge_gather(1.f);
         bool below = false;

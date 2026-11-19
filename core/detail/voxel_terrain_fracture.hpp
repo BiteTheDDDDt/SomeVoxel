@@ -24,10 +24,12 @@ private:
     std::vector<std::pair<int, float>> compaction_jobs;
     struct CompressionHistory {
         float work = 0.f;
+        float pressure = 0.f;
         uint32_t last_contact = 0;
         uint32_t retry_after = 0;
     };
     std::unordered_map<int, CompressionHistory> contact_compression;
+    std::vector<int> sampled_compression_sites;
     std::array<int, Char + 1> terrain_contact_breaks{};
     std::array<TerrainImpactPeak, Char + 1> terrain_impact_peaks{};
 
@@ -50,6 +52,7 @@ private:
         packed_fracture_jobs.clear();
         compaction_jobs.clear();
         contact_compression.clear();
+        sampled_compression_sites.clear();
         terrain_contact_breaks.fill(0);
         terrain_impact_peaks.fill({});
     }
@@ -120,7 +123,22 @@ private:
             entry = contact_compression.emplace(id, CompressionHistory{}).first;
         }
         auto &history = entry->second;
-        if (history.last_contact == tick) return;
+        if (history.pressure == 0.f) sampled_compression_sites.push_back(id);
+        history.pressure = std::max(history.pressure, pressure);
+    }
+
+    void integrate_contact_pressure() {
+        // Visit sites in sweep order. Each contributes its strongest sample
+        // once, even when several grains press on the same region.
+        for (int id : sampled_compression_sites) {
+            auto &history = contact_compression.at(id);
+            const float pressure = std::exchange(history.pressure, 0.f);
+            accumulate_site_pressure(id, history, pressure);
+        }
+        sampled_compression_sites.clear();
+    }
+
+    void accumulate_site_pressure(int id, CompressionHistory &history, float pressure) {
         const uint32_t sample_gap = tick - history.last_contact;
         if (sample_gap > 2) {
             const float gap = (sample_gap - 2) * dt;
@@ -137,7 +155,7 @@ private:
         history.work = std::min(threshold,
             history.work + (pressure - sand_yield_pressure) * closure_volume * max_closure_rate * duration);
         if (history.work >= threshold && tick >= history.retry_after && compaction_jobs.size() < 64) {
-            record_compaction_load(anchor, {history.work, {}});
+            compaction_jobs.emplace_back(id, history.work);
             history.retry_after = tick + std::max(1, simulation_hz / 15);
         }
     }
@@ -157,6 +175,7 @@ private:
         const V3 internal = acceleration + V3(0, gravity, 0);
         float best = sand_yield_pressure;
         int bearing = -1;
+        I3 normal;
         for (int axis = 0; axis < 3; ++axis) {
             // Adjacent sand shares gravity. Only a fixed support can turn
             // common downward acceleration into contact load.
@@ -177,13 +196,33 @@ private:
                 if (pressure > best) {
                     best = pressure;
                     bearing = obstacle;
+                    normal = {};
+                    normal[axis] = direction;
                 }
             }
         }
-        if (bearing >= 0) record_contact_pressure(kind == Sand ? from : decode(bearing), best);
+        if (bearing < 0) return;
+        if (voxels[bearing].kind != Sand) {
+            if (kind == Sand) record_contact_pressure(from, best);
+            return;
+        }
+        const I3 contact = decode(bearing);
+        record_contact_pressure(contact, best);
+        // Follow a short, solid path into the load-bearing sand. A gap ends
+        // the path. Updating only the far end bounds cache traffic per sample.
+        constexpr int bearing_cells = int(0.18f / scale + 0.5f);
+        const float transmitted = best * 0.9f;
+        if (transmitted <= sand_yield_pressure) return;
+        I3 inner = contact;
+        for (int i = 1; i < bearing_cells; ++i) {
+            if (kind_at(inner + normal) != Sand) break;
+            inner += normal;
+        }
+        if (inner != contact) record_contact_pressure(inner, transmitted);
     }
 
     void finish_contact_compaction() {
+        integrate_contact_pressure();
         if (!contact_compression.empty() && tick % uint32_t(simulation_hz / 4) == 0) {
             for (auto entry = contact_compression.begin(); entry != contact_compression.end();) {
                 if (tick - entry->second.last_contact > uint32_t(simulation_hz / 4)) entry = contact_compression.erase(entry);
