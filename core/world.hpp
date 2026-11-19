@@ -23,6 +23,54 @@
 
 namespace somevoxel {
 
+namespace detail {
+// Use successive required rebuilds to compare backends. The first run on
+// each side warms allocations and device pipelines before measuring costs.
+class WaterHeadSelection {
+    static constexpr int probes = 8, reuse = 96;
+    int probe = 0, remaining = 0;
+    int64_t initial_cells = 0, initial_height = 0, initial_topology = 0;
+    std::array<std::array<int64_t, 3>, 2> samples{};
+    bool prefer_gpu = false;
+
+public:
+    bool choose_gpu(int64_t cells, int height, int64_t topology) {
+        if (probe == probes) {
+            const bool changed = std::abs(cells - initial_cells) * 2 > initial_cells ||
+                std::abs(height - initial_height) * 2 > initial_height ||
+                topology - initial_topology > initial_cells;
+            if (remaining > 0 && (remaining > reuse - 16 || !changed)) {
+                --remaining;
+                return prefer_gpu;
+            }
+            probe = 0;
+        }
+        if (probe == 0) {
+            initial_cells = cells;
+            initial_height = height;
+            initial_topology = topology;
+        }
+        return (probe & 1) != 0;
+    }
+
+    void measured(int64_t microseconds) {
+        if (probe == probes) return;
+        if (probe >= 2) samples[probe % 2][(probe - 2) / 2] = microseconds;
+        if (++probe == probes) {
+            for (auto &costs : samples) std::sort(costs.begin(), costs.end());
+            prefer_gpu = samples[1][1] < samples[0][1];
+            remaining = reuse;
+        }
+    }
+
+    void gpu_failed() {
+        prefer_gpu = false;
+        probe = probes;
+        remaining = reuse;
+    }
+};
+} // namespace detail
+
 class World {
     friend class WorldPresentation;
 
@@ -1498,6 +1546,7 @@ public:
         if (limit != requested_water_workers) {
             requested_water_workers = limit;
             water_spans.reset();
+            head_selection = {};
         }
 #else
         (void)limit;
@@ -1522,11 +1571,20 @@ public:
     using WaterHeadAccelerator = std::function<bool(const std::vector<uint8_t> &, int, int, int,
         std::vector<uint8_t> &)>;
 
-    void set_water_head_accelerator(WaterHeadAccelerator accelerator) {
+    struct WaterHeadTimes {
+        bool automatic = false, last_gpu = false;
+        int64_t cpu_us = 0, gpu_us = 0, first_cpu_us = 0, first_gpu_us = 0;
+    };
+    const WaterHeadTimes &water_head_times() const { return head_times; }
+
+    void set_water_head_accelerator(WaterHeadAccelerator accelerator, bool auto_select = false) {
 #ifdef SOMEVOXEL_PARALLEL_WATER_WORKERS
         water_head_accelerator = std::move(accelerator);
+        head_times = {auto_select && bool(water_head_accelerator)};
+        head_selection = {};
 #else
         (void)accelerator;
+        (void)auto_select;
 #endif
     }
 

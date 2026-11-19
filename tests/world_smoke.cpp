@@ -1,6 +1,35 @@
 #include "core/world.hpp"
 #include <iostream>
 
+static bool water_head_selection() {
+    const auto check = [](bool faster_gpu) {
+        somevoxel::detail::WaterHeadSelection selector;
+        const int cpu = faster_gpu ? 400 : 100, gpu = faster_gpu ? 100 : 400;
+        for (int run = 0; run < 8; ++run) {
+            const bool device = selector.choose_gpu(1000, 100, 0);
+            if (device != bool(run & 1)) return false;
+            // Cold-start cost and an isolated outlier cannot pick the winner.
+            selector.measured(run < 2 || run == 6 || run == 7 ? 5000 : (device ? gpu : cpu));
+        }
+        for (int run = 0; run < 16; ++run) {
+            if (selector.choose_gpu(1000, 100, 0) != faster_gpu) return false;
+            selector.measured(1);
+        }
+        if (selector.choose_gpu(2200, 100, 0)) return false;
+        selector.measured(cpu);
+        if (!selector.choose_gpu(2200, 100, 0)) return false;
+        selector.gpu_failed();
+        for (int run = 0; run < 96; ++run) {
+            if (selector.choose_gpu(2200, 100, 0)) return false;
+            selector.measured(cpu);
+        }
+        if (selector.choose_gpu(2200, 100, 0)) return false;
+        selector.measured(cpu);
+        return selector.choose_gpu(2200, 100, 0);
+    };
+    return check(true) && check(false);
+}
+
 static bool communicating_vessels(somevoxel::World &world) {
     using somevoxel::World;
     const int stone = World::Stone, water = World::Water;
@@ -35,6 +64,10 @@ static bool communicating_vessels(somevoxel::World &world) {
 }
 
 int main() {
+    if (!water_head_selection()) {
+        std::cerr << "Water head backend selection or GPU failure recovery failed\n";
+        return 1;
+    }
     using somevoxel::World;
     World world;
     const int32_t floor[] = {0, 0, 0, 32, 1, 32, World::Stone};

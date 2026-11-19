@@ -170,7 +170,9 @@ bool World::load_boxes(const int32_t *layout, size_t length) {
     accelerated_head_rebuilds = 0;
     accelerator_attempts = 0;
     accelerator_time_us = 0;
+    head_selection = {};
 #endif
+    head_times = {head_times.automatic};
     liquid_motion.clear();
     reset_particle_forms();
     charge_gather = 0.f;

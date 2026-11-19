@@ -17,6 +17,12 @@ var _uniforms := RID()
 var _buffers: Array[RID] = []
 var _capacity := 0
 
+## Pay device and shader startup during map loading on eligible worlds.
+func prepare() -> bool:
+	if _capacity > 0:
+		return true
+	return solve_compact(PackedByteArray([1, 0, 0, 0]), Vector3i.ONE) == PackedByteArray([1])
+
 ## shape.x is the number of packed 8-cell rows along X. Input is padded
 ## to four bytes. Each output row contains four little-endian uint16 heads
 ## in the order of its occupied X runs. Unused entries are zero.
@@ -56,19 +62,24 @@ func _solve(rows: PackedByteArray, shape: Vector3i, compact: bool) -> PackedByte
 		if mode < 3:
 			_rd.compute_list_add_barrier(commands)
 	_rd.compute_list_end()
+	# Queue the transfer before the fence. Keep the destination local so a
+	# callback delivered later by another Godot version cannot replace it.
+	var read_bytes := ((count + 3) & ~3) if compact else count * HEAD_BYTES_PER_ROW
+	var result: Array[PackedByteArray] = [PackedByteArray()]
+	var receive := func(data: PackedByteArray) -> void: result[0] = data
+	_rd.buffer_get_data_async(_buffers[2], receive, 0, read_bytes)
 	_rd.submit()
 	_rd.sync()
+	var heads := result[0]
+	if heads.size() != read_bytes:
+		heads = _rd.buffer_get_data(_buffers[2], 0, read_bytes)
+	if heads.size() != read_bytes:
+		return empty
 	if compact:
-		var aligned := (count + 3) & ~3
-		var shared_heads := _rd.buffer_get_data(_buffers[2], 0, aligned)
-		if shared_heads.size() != aligned:
-			return empty
-		if not shared_heads.has(255):
-			shared_heads.resize(count)
-			return shared_heads
-		return _rd.buffer_get_data(_buffers[2], aligned, count * 4)
-	var heads := _rd.buffer_get_data(_buffers[2], 0, count * HEAD_BYTES_PER_ROW)
-	return heads if heads.size() == count * HEAD_BYTES_PER_ROW else empty
+		if heads.has(255):
+			return _rd.buffer_get_data(_buffers[2], read_bytes, count * 4)
+		heads.resize(count)
+	return heads
 
 func close() -> void:
 	if _rd == null:

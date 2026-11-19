@@ -40,7 +40,8 @@ protected:
         ClassDB::bind_method(D_METHOD("set_sand_sweep_profiling", "enabled"), &VoxelWorld::set_sand_sweep_profiling);
         ClassDB::bind_method(D_METHOD("sand_sweep_stats"), &VoxelWorld::sand_sweep_stats);
         ClassDB::bind_method(D_METHOD("set_water_workers", "limit"), &VoxelWorld::set_water_workers);
-        ClassDB::bind_method(D_METHOD("set_water_head_accelerator", "solve"), &VoxelWorld::set_water_head_accelerator);
+        ClassDB::bind_method(D_METHOD("set_water_head_accelerator", "solve", "auto_select"),
+                &VoxelWorld::set_water_head_accelerator, DEFVAL(false));
         ClassDB::bind_method(D_METHOD("packed_particle_mass", "extent"), &VoxelWorld::packed_particle_mass);
         ClassDB::bind_method(D_METHOD("spawn_packed_particle", "position", "extent", "impulse"),
             &VoxelWorld::spawn_packed_particle, DEFVAL(V3()));
@@ -135,7 +136,7 @@ public:
     }
     void set_water_workers(int limit) { world.set_water_workers(limit); }
 
-    void set_water_head_accelerator(const godot::Callable &solve) {
+    void set_water_head_accelerator(const godot::Callable &solve, bool auto_select = false) {
         if (!solve.is_valid()) {
             world.set_water_head_accelerator({});
             return;
@@ -151,7 +152,7 @@ public:
             if (output.is_empty()) return false;
             heads.assign(output.ptr(), output.ptr() + output.size());
             return true;
-        });
+        }, auto_select);
     }
 
     bool load_boxes(const godot::PackedInt32Array &layout) {
@@ -189,6 +190,13 @@ public:
         result["water_head_accelerated_rebuilds"] = world.water_head_accelerated_rebuilds();
         result["water_head_accelerator_attempts"] = world.water_head_accelerator_attempts();
         result["water_head_accelerator_time_us"] = world.water_head_accelerator_time_us();
+        const auto &heads = world.water_head_times();
+        result["water_head_backend"] = heads.last_gpu ? "GPU" : "CPU";
+        result["water_head_auto_select"] = heads.automatic;
+        result["water_head_cpu_time_us"] = heads.cpu_us;
+        result["water_head_gpu_time_us"] = heads.gpu_us;
+        result["water_head_first_cpu_time_us"] = heads.first_cpu_us;
+        result["water_head_first_gpu_time_us"] = heads.first_gpu_us;
         result["voxel_bytes"] = state.voxel_bytes;
         result["grain_bytes"] = state.grain_bytes;
         result["dense_grid_bytes"] = state.dense_grid_bytes;

@@ -76,12 +76,24 @@ private:
     int64_t accelerated_head_rebuilds = 0;
     int64_t accelerator_attempts = 0;
     int64_t accelerator_time_us = 0;
+    detail::WaterHeadSelection head_selection;
 
     PackedWaterSpans &water_solver() const {
         if (!water_spans) water_spans = std::make_unique<PackedWaterSpans>(water_worker_count());
         return *water_spans;
     }
 #endif
+    WaterHeadTimes head_times;
+
+    int64_t record_head_time(bool gpu, std::chrono::steady_clock::time_point start) {
+        const int64_t elapsed = std::max<int64_t>(1, std::chrono::duration_cast<std::chrono::microseconds>(
+                std::chrono::steady_clock::now() - start).count());
+        int64_t &first = gpu ? head_times.first_gpu_us : head_times.first_cpu_us;
+        if (!first) first = elapsed;
+        (gpu ? head_times.gpu_us : head_times.cpu_us) = elapsed;
+        head_times.last_gpu = gpu;
+        return elapsed;
+    }
     std::vector<int> pressure_component;
     std::vector<PressureNode> pressure_nodes;
     std::vector<int> pressure_sources;
@@ -228,6 +240,8 @@ private:
             pressure_body_feet != body_feet || pressure_body_radius != body_radius || pressure_body_height != body_height);
         const bool head_current = head_version == water_topology_version;
         if (head_current && !balance) return;
+        auto head_start = std::chrono::steady_clock::time_point{};
+        if (!balance) head_start = std::chrono::steady_clock::now();
         if (!head_current) liquid_head.prepare(water_chunk_counts);
         head_version = water_topology_version;
         if (balance) {
@@ -260,21 +274,29 @@ private:
                             pressure_surfaces, apply_head, can_publish)) return;
                 }
             } else {
-                if (water_head_accelerator && water_positions.size() >= 1000000) {
-                    const auto start = std::chrono::steady_clock::now();
+                const bool eligible = water_head_accelerator && water_positions.size() >= 1000000;
+                const bool compare = eligible && head_times.automatic;
+                const bool gpu = eligible && (!compare || head_selection.choose_gpu(
+                        int64_t(water_positions.size()), water_scan_end / slice, water_topology_version));
+                if (gpu) {
                     const bool solved = solver.try_accelerated_rows(bulk_water_rows, liquid_motion,
                         water_scan_end / slice, water_head_accelerator, apply_head);
+                    const auto elapsed = record_head_time(true, head_start);
                     ++accelerator_attempts;
-                    accelerator_time_us += std::chrono::duration_cast<std::chrono::microseconds>(
-                        std::chrono::steady_clock::now() - start).count();
+                    accelerator_time_us += elapsed;
                     if (solved) {
                         ++accelerated_head_rebuilds;
+                        if (compare) head_selection.measured(elapsed);
                         return;
                     }
+                    if (compare) head_selection.gpu_failed();
+                    head_start = std::chrono::steady_clock::now();
                 }
                 // Sparse scenes benefit from visiting just their parcel list.
                 if (use_rows) solver.rebuild_rows(bulk_water_rows, liquid_motion, water_scan_end / slice, apply_head);
                 else solver.rebuild(water_positions, apply_head);
+                const auto elapsed = record_head_time(false, head_start);
+                if (compare && !gpu) head_selection.measured(elapsed);
                 return;
             }
         }
@@ -326,4 +348,5 @@ private:
                 if (record_routes) balance_pressure(y, transfers, faces);
             }
         }
+        if (!balance) record_head_time(false, head_start);
     }

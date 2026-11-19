@@ -7,9 +7,10 @@ func _initialize() -> void:
 
 func verify() -> void:
 	var solver := Heads.new()
+	var ready := solver.prepare() and solver.prepare()
 	# Both X runs have the same head. The final row ends in a partial word.
 	var shared_heads := solver.solve_compact(PackedByteArray([5, 5, 0, 0]), Vector3i(1, 3, 1))
-	var ok := shared_heads == PackedByteArray([2, 2, 0])
+	var ok := ready and shared_heads == PackedByteArray([2, 2, 0])
 	# The two runs in the first row drain into columns of different heights.
 	var split := solver.solve_compact(PackedByteArray([5, 4, 4, 0]), Vector3i(1, 3, 1))
 	ok = ok and split == PackedByteArray([1, 3, 0, 0, 3, 0, 0, 0, 3, 0, 0, 0])
