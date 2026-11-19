@@ -1390,6 +1390,7 @@ private:
                 acceleration += relative_wind * (2.f * drag * pressure);
             }
         }
+        sample_bearing_contact(grain, from, kind, acceleration, fits);
         if (kind == Sand && !form && airborne_earth_ejecta.empty() && step_enclosed_sand(grain, from, acceleration, attracted))
             return {from, from};
         I3 slope;

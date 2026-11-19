@@ -108,6 +108,43 @@ static bool loaded_sand_compacts(somevoxel::World &world) {
     return true;
 }
 
+static bool sustained_compression(somevoxel::World &world) {
+    using somevoxel::Vec3;
+    using somevoxel::World;
+    const int32_t layout[] = {
+        0, 0, 0, 130, 4, 130, World::Stone,
+        53, 4, 53, 66, 12, 66, World::Sand,
+        66, 4, 51, 68, 16, 68, World::Stone,
+        53, 4, 51, 66, 15, 53, World::Stone,
+        53, 4, 66, 66, 15, 68, World::Stone,
+    };
+    const Vec3 focus = Vec3(65.5f, 8.5f, 59.5f) * world.status().cell_size;
+    for (const bool form : {false, true}) {
+        for (const bool strong : {false, true}) {
+            if (!world.load_boxes(layout, std::size(layout))) return false;
+            const auto initial = world.status();
+            const float strength = strong ? 5.f : 0.1f;
+            world.set_cast_profile(1.f, strength);
+            if (form) world.set_particle_form(focus, {1.f, 0.f, 0.f}, World::Sand, 1, 0.72f, strength);
+            else world.set_field(focus, true);
+            world.set_charge_gather(1.f);
+            bool compacted = false;
+            for (int i = 0; i < 180; ++i) {
+                world.step();
+                const auto state = world.status();
+                if (state.sand_mass != initial.sand_mass) return false;
+                if (state.packed_sand_blocks > 0 && state.sand_volume < initial.sand_volume) {
+                    if (i < 8) return false;
+                    compacted = true;
+                    break;
+                }
+            }
+            if (compacted != strong) return false;
+        }
+    }
+    return true;
+}
+
 int main() {
     if (!water_head_selection()) {
         std::cerr << "Water head backend selection or GPU failure recovery failed\n";
@@ -183,4 +220,9 @@ int main() {
         return 1;
     }
     std::cout << "Only the strong contact compacted sand, preserving its mass\n";
+    if (!sustained_compression(world)) {
+        std::cerr << "Sustained contact failed to distinguish gentle and strong compression\n";
+        return 1;
+    }
+    std::cout << "Sustained bearing loads compacted held sand without changing its mass\n";
 }
