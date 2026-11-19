@@ -218,6 +218,31 @@ static bool compression_below_focus(somevoxel::World &world) {
     return true;
 }
 
+static bool sand_cast_strength(somevoxel::World &world) {
+    using somevoxel::Vec3;
+    using somevoxel::World;
+    const int32_t layout[] = {60, 35, 60, 61, 36, 61, World::Sand};
+    const float pitch = world.status().cell_size;
+    const Vec3 source = Vec3(60.5f, 35.5f, 60.5f) * pitch;
+    const Vec3 focus = source + Vec3(0.4f, 0, 0);
+    for (const bool shaped : {false, true}) {
+        float default_travel = 0.f;
+        for (const float strength : {1.f, 5.f}) {
+            if (!world.load_boxes(layout, std::size(layout))) return false;
+            world.set_cast_profile(1.f, strength);
+            if (shaped) world.set_particle_form(focus, {0, 0, 1}, World::Sand, 1, 2.4f, strength);
+            else world.set_field(focus, true);
+            for (int tick = 0; tick < 12; ++tick) world.step();
+            const auto state = shaped ? world.particle_form_throw() : world.free_sand_throw(focus);
+            if (state.count != 1) return false;
+            const float travel = state.position.x - source.x;
+            if (strength == 1.f) default_travel = travel;
+            else if (travel <= default_travel + 2.f * pitch) return false;
+        }
+    }
+    return true;
+}
+
 int main() {
     if (!water_head_selection()) {
         std::cerr << "Water head backend selection or GPU failure recovery failed\n";
@@ -308,4 +333,9 @@ int main() {
         return 1;
     }
     std::cout << "Free and shaped convergence compacted supported sand below the focus\n";
+    if (!sand_cast_strength(world)) {
+        std::cerr << "Increasing cast strength did not accelerate loose or shaped sand\n";
+        return 1;
+    }
+    std::cout << "Higher cast strength moved loose and shaped sand farther in the same time\n";
 }

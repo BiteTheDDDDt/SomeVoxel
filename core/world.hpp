@@ -1647,14 +1647,16 @@ public:
     void set_cast_profile(float radius_scale, float strength) {
         if (!std::isfinite(radius_scale) || !std::isfinite(strength)) return;
         const float next_radius = std::clamp(radius_scale, 0.10f, 2.50f);
-        if (next_radius != cast_radius_scale) {
+        const float next_strength = std::clamp(strength, 0.10f, 5.f);
+        if (next_radius != cast_radius_scale || next_strength != cast_strength) {
+            const float wake_radius = std::max(cast_radius_scale, next_radius);
             if (pulling) wake_field();
-            if (pulling_water) wake_reaction_area(water_field, water_pull_radius * cast_radius_scale);
-            if (pulling_vines) wake_reaction_area(vine_field, vine_pull_radius * cast_radius_scale);
-            if (winding) wake_reaction_area(wind_point, wind_radius * cast_radius_scale);
-            cast_radius_scale = next_radius;
+            if (pulling_water) wake_reaction_area(water_field, water_pull_radius * wake_radius);
+            if (pulling_vines) wake_reaction_area(vine_field, vine_pull_radius * wake_radius);
+            if (winding) wake_reaction_area(wind_point, wind_radius * wake_radius);
         }
-        cast_strength = std::clamp(strength, 0.10f, 5.f);
+        cast_radius_scale = next_radius;
+        cast_strength = next_strength;
     }
 
     V3 wind_acceleration_at(V3 point) const {
