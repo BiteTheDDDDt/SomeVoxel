@@ -207,6 +207,8 @@ private:
     std::vector<uint8_t> bulk_water_rows = std::vector<uint8_t>(nx * ny * nz / block);
     // Includes moving and formed water. One count covers an 8-cubed chunk.
     std::vector<uint16_t> water_chunk_counts = std::vector<uint16_t>(chunk_count);
+    std::vector<uint16_t> sand_chunk_counts = std::vector<uint16_t>(chunk_count);
+    std::vector<uint8_t> settled_sand_chunks = std::vector<uint8_t>(chunk_count);
     std::vector<Grain> grains;
     std::vector<Grain> gravel;
     std::unordered_map<int64_t, int> tracked_packed_particles;
@@ -286,6 +288,56 @@ private:
     static V3 center(I3 p) { return (V3(p) + V3(0.5f, 0.5f, 0.5f)) * scale; }
     static int chunk_id(I3 p) { return p.x + bx * (p.z + bz * p.y); }
     static int chunk_at(I3 p) { return chunk_id({p.x / block, p.y / block, p.z / block}); }
+
+    void change_sand_count(int id, int delta) {
+        sand_chunk_counts[id] = uint16_t(sand_chunk_counts[id] + delta);
+        settled_sand_chunks[id] = false;
+    }
+
+    void add_sand_grain(Grain grain) {
+        change_sand_count(chunk_at(decode(grain.position)), 1);
+        grains.push_back(grain);
+    }
+
+    bool full_sand_neighborhood(I3 chunk) const {
+        if (chunk.x == 0 || chunk.x + 1 == bx || chunk.y == 0 || chunk.y + 1 == by ||
+                chunk.z == 0 || chunk.z + 1 == bz) return false;
+        constexpr int full = block * block * block;
+        const int id = chunk_id(chunk);
+        return sand_chunk_counts[id] == full &&
+            sand_chunk_counts[id - 1] == full && sand_chunk_counts[id + 1] == full &&
+            sand_chunk_counts[id - bx] == full && sand_chunk_counts[id + bx] == full &&
+            sand_chunk_counts[id - bx * bz] == full && sand_chunk_counts[id + bx * bz] == full;
+    }
+
+    static float chunk_distance_squared(I3 chunk, V3 point) {
+        const V3 low = V3(chunk) * (block * scale);
+        const V3 high = low + V3(block * scale, block * scale, block * scale);
+        return point.distance_squared_to(point.clamp(low, high));
+    }
+
+    void certify_settled_sand(I3 chunk) {
+        const int id = chunk_id(chunk);
+        // A missed certification just runs the regular sweep. Stagger
+        // retries across chunks so moving interiors are not reread every step.
+        if (settled_sand_chunks[id] || ((uint32_t(id) ^ tick) & 7u) ||
+                sand_chunk_counts[id] != block * block * block ||
+                !full_sand_neighborhood(chunk)) return;
+        const float reach = 2.4f * cast_radius_scale + 1.75f * scale;
+        if (pulling && chunk_distance_squared(chunk, field) <= reach * reach) return;
+        const I3 start = chunk * block;
+        for (int y = 0; y < block; ++y)
+            for (int z = 0; z < block; ++z) {
+                const int row = flat(start + I3(0, y, z));
+                for (int x = 0; x < block; ++x) {
+                    const Voxel &cell = voxels[row + x];
+                    const Grain &grain = grains[cell.occupant];
+                    if (cell.formed || grain.velocity != V3() || grain.travel.y != 0.f ||
+                            (grain.blocked_faces & grain_axis_faces(1))) return;
+                }
+            }
+        settled_sand_chunks[id] = true;
+    }
     static uint32_t hash(uint32_t key) {
         key ^= key >> 16;
         key *= 0x7feb352du;
@@ -376,10 +428,11 @@ private:
     }
 
     void wake_near(I3 p, std::array<bool, chunk_count> &chunks) {
+        const int id = chunk_at(p);
         // An interior cell and all of its neighbors are in the same chunk.
         const int x = p.x & (block - 1), y = p.y & (block - 1), z = p.z & (block - 1);
         if (x > 0 && x < block - 1 && y > 0 && y < block - 1 && z > 0 && z < block - 1) {
-            chunks[chunk_id({p.x / block, p.y / block, p.z / block})] = true;
+            chunks[id] = true;
             return;
         }
         wake_box(p, p, chunks);
@@ -407,7 +460,11 @@ private:
                 if (x_budget < 0.f) continue;
                 for (int x = lo.x; x <= hi.x; ++x) {
                     const float dx = outside(field.x, x);
-                    if (dx * dx <= x_budget) awake[chunk_id({x, y, z})] = true;
+                    if (dx * dx <= x_budget) {
+                        const int id = chunk_id({x, y, z});
+                        awake[id] = true;
+                        settled_sand_chunks[id] = false;
+                    }
                 }
             }
         }
@@ -459,6 +516,14 @@ private:
             record_grain_move(grains[source.occupant], b, moved_grains);
             mark_sand_tiles(from);
             mark_sand_tiles(to);
+        }
+        if (source.kind != destination.kind && (source.kind == Sand || destination.kind == Sand)) {
+            const int origin = chunk_at(from), target = chunk_at(to);
+            if (origin != target) {
+                const int delta = source.kind == Sand ? -1 : 1;
+                change_sand_count(origin, delta);
+                change_sand_count(target, -delta);
+            }
         }
         const auto shift_element = [&](const Voxel &cell, int target) {
             if (!element_kind(cell.kind)) return;
@@ -629,6 +694,7 @@ private:
     }
 
     void erase_sand(int id) {
+        change_sand_count(chunk_at(decode(grains[id].position)), -1);
         if (!sand_tile_dirty.empty()) mark_sand_tiles(decode(grains[id].position));
         if (!airborne_earth_ejecta.empty()) airborne_earth_ejecta.erase(grains[id].position);
         if (!wet_sand.empty()) wet_sand.erase(grains[id].position);
@@ -736,7 +802,7 @@ private:
             if (handoff_motion) ensure_liquid_motion(i) = prior_motion;
         } else if (next == Sand) {
             voxels[i].occupant = int(grains.size());
-            grains.push_back({i, i, tick});
+            add_sand_grain({i, i, tick});
             mark_sand_tiles(p);
         } else if (element_kind(next)) {
             attach_element(i, next);
@@ -1096,7 +1162,9 @@ private:
                 record_compaction_load(attempted, {0.125f * mass * relative_speed * relative_speed, {}});
             const float shared = (grain.velocity[axis] * mass + other.velocity[axis] * mass) / (mass + mass);
             grain.velocity[axis] = other.velocity[axis] = shared;
-            next_awake[chunk_at(attempted)] = true;
+            const int chunk = chunk_at(attempted);
+            next_awake[chunk] = true;
+            settled_sand_chunks[chunk] = false;
         }
     }
 
@@ -1153,6 +1221,7 @@ private:
             / (mass + other_mass);
         grain.velocity[axis] = shared_speed;
         other->velocity[axis] = shared_speed;
+        if (other_kind == Sand) settled_sand_chunks[chunk_at(decode(blocking_voxel))] = false;
         const I3 p = kind == Gravel ? decode(blocking_voxel) : attempted;
         next_awake[chunk_at(p)] = true;
     }
@@ -2142,6 +2211,7 @@ private:
         grain.velocity += kick * std::sqrt(1.f - fracture_fraction);
         for (int axis = 0; axis < 3; ++axis)
             grain.velocity[axis] = std::clamp<float>(grain.velocity[axis], -maximum_swept_speed, maximum_swept_speed);
+        if (kind == Sand) settled_sand_chunks[chunk_at(p)] = false;
         wake_near(p, awake);
         return {fracture_work, {}};
     }
@@ -2263,7 +2333,7 @@ public:
         data.voxel_bytes = sizeof(Voxel);
         data.grain_bytes = sizeof(Grain);
         data.dense_grid_bytes = voxels.size() * sizeof(Voxel) + mobile_rows.size() + mobile_row_groups.size() + bulk_water_rows.size() +
-            water_chunk_counts.size() * sizeof(uint16_t) +
+            (water_chunk_counts.size() + sand_chunk_counts.size()) * sizeof(uint16_t) + settled_sand_chunks.size() +
             liquid_head.bytes() + previous_water_heads.capacity() * sizeof(LiquidHead) +
             body_mask.bytes() + support_seen.bytes();
 #ifdef SOMEVOXEL_PARALLEL_WATER_WORKERS

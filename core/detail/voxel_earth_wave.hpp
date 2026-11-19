@@ -160,6 +160,7 @@ private:
         particle.velocity += impulse / gravel_density_ratio(particle);
         particle.velocity.y = std::clamp<float>(particle.velocity.y, 0.f, maximum_particle_speed);
         const I3 start = decode(particle.position);
+        settled_sand_chunks[chunk_at(start)] = false;
         const int edge = particle.extent - 1;
         if (edge > 0) wake_box(start, start + I3(edge, edge, edge), awake);
         else wake_near(start, awake);

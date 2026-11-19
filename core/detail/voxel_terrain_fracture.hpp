@@ -193,6 +193,35 @@ private:
         return field_drive(grains[voxel.occupant], position, Sand, form, attracted, true);
     }
 
+    int sand_bearing_run(I3 from, int axis, int direction, int limit, bool &supported) const {
+        constexpr int dimensions[] = {nx, ny, nz};
+        constexpr int strides[] = {1, slice, nx};
+        const int available = direction > 0 ? dimensions[axis] - 1 - from[axis] : from[axis];
+        const int end = std::min(limit, available);
+        const int start = flat(from);
+        const int stride = strides[axis] * direction;
+        int run = 0;
+        while (run < end) {
+            const int coordinate = from[axis] + (run + 1) * direction;
+            const int lane = coordinate & (block - 1);
+            if (run == 0 || lane == (direction > 0 ? 0 : block - 1)) {
+                I3 next = from;
+                next[axis] = coordinate;
+                if (sand_chunk_counts[chunk_at(next)] == block * block * block) {
+                    run += std::min(end - run, direction > 0 ? block - lane : lane + 1);
+                    continue;
+                }
+            }
+            const int index = start + (run + 1) * stride;
+            if (voxels[index].kind != Sand) {
+                supported = retains_grain_face(index);
+                break;
+            }
+            ++run;
+        }
+        return run;
+    }
+
     void sample_field_bearing_contact(I3 from, float coverage) {
         constexpr float bearing_depth = 0.18f;
         constexpr int bearing_cells = int(bearing_depth / scale + 0.5f);
@@ -203,20 +232,10 @@ private:
             bool supported[2]{};
             for (int side = 0; side < 2; ++side) {
                 const int direction = 2 * side - 1;
-                I3 normal;
-                normal[axis] = direction;
+                const int run = sand_bearing_run(from, axis, direction, bearing_cells, supported[side]);
                 I3 endpoint = from;
-                for (int step = 0; step < bearing_cells; ++step) {
-                    const I3 next = endpoint + normal;
-                    if (!inside(next)) break;
-                    const int index = flat(next);
-                    if (voxels[index].kind != Sand) {
-                        supported[side] = retains_grain_face(index);
-                        break;
-                    }
-                    endpoint = next;
-                }
-                if (endpoint != from)
+                endpoint[axis] += direction * run;
+                if (run != 0)
                     opposing[side] = std::max(0.f, -direction * sand_elastic_acceleration(endpoint)[axis]);
                 if (supported[side])
                     best = std::max(best, sand_density * bearing_depth * coverage *
@@ -484,7 +503,7 @@ private:
             invalidate_support_above(start, extent);
             const auto release = [&](int i) {
                 voxels[i] = {Sand, voxel_stamp, int(grains.size())};
-                grains.push_back({i, i, tick, 1, grain.velocity});
+                add_sand_grain({i, i, tick, 1, grain.velocity});
                 if (!sand_tile_dirty.empty()) mark_sand_tiles(decode(i));
                 queue_sand_contact(i);
                 set_mobile(i, true);

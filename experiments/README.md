@@ -4,6 +4,19 @@ These probes run independently of the production solver. Measurements below used
 
 [Follow-up experiments on rate, CPU reconstruction and numeric precision](performance_precision.md)
 
+### Local sand work
+
+`somevoxel_local_sand_bench` replays settling, a local radial pull, forming and releasing a shot, and impact with a timber wall in a dry slope with 2,851,848 loose grains. Build Release with `SOMEVOXEL_BUILD_EXPERIMENTS=ON`, `SOMEVOXEL_REFINEMENT=18`, `SOMEVOXEL_EXPERIMENTAL_SIMULATION_HZ=120`, `SOMEVOXEL_EXPERIMENTAL_WATER_HZ=60`, and `SOMEVOXEL_EXPERIMENTAL_WATER_SWEEP_PHASE=ON`. The report measures whole simulation steps with diagnostic counters enabled.
+
+| Phase | Baseline P95 step (ms) | Local sampling P95 step (ms) |
+| --- | ---: | ---: |
+| Settling | 66.7–67.5 | 55.6–57.8 |
+| Radial pull | 159.7–161.6 | 155.0–161.3 |
+| Forming | 195.1–196.6 | 162.2 |
+| Impact | 168.4–171.6 | 155.4–166.5 |
+
+Two sequential runs per build on a Ryzen 9 8945HX. The baseline was `54bf549` with a counter added to its existing recruitment loop. Recruitment visited 19,956,294 candidates in the baseline and 118,044 after indexing. The settling phase skipped 1,492,480 visits to fully enclosed, motionless sand. Counts entering the integrator, swept faces tested, contacts, sand mass, packed occupancy in both height bands and wall fractures matched. Both builds launched 464 bodies and measured a 0.051103 N·s peak face impulse.
+
 ### Physical-unit replay
 
 Build `somevoxel_rate_bench` with `-DSOMEVOXEL_BUILD_EXPERIMENTS=ON` and the grid and tick-rate settings to compare. Run `launch-budget` to check the selected loose-sand mass against the 131.22 kg reference with a full supply. Run `wall-sweep` to check that a shot that clears the wall plane in one tick without an obstacle still stops at the face of a one-cell wall. An acceptance check exits with a nonzero status on failure.

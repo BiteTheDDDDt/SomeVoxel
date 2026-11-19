@@ -9,6 +9,8 @@ namespace somevoxel {
 
 struct SandSweepStats {
     int64_t empty_rows = 0;
+    int64_t settled_skipped = 0;
+    int64_t form_scanned = 0;
     int64_t integrated = 0;
     int64_t tested_faces = 0;
     int64_t crossed_faces = 0;

@@ -129,6 +129,8 @@ public:
         const auto &stats = world.sand_sweep_stats();
         godot::Dictionary result;
         result["empty_rows"] = stats.empty_rows;
+        result["settled_skipped"] = stats.settled_skipped;
+        result["form_scanned"] = stats.form_scanned;
         result["integrated"] = stats.integrated;
         result["tested_faces"] = stats.tested_faces;
         result["crossed_faces"] = stats.crossed_faces;

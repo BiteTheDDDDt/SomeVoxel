@@ -133,6 +133,39 @@ static bool pressure_api(somevoxel::World &world) {
     return true;
 }
 
+static bool sand_locality(somevoxel::World &world) {
+    using somevoxel::Vec3;
+    using somevoxel::World;
+    const int32_t layout[] = {
+        0, 0, 0, 130, 8, 130, World::Stone,
+        24, 8, 24, 48, 32, 48, World::Sand,
+        88, 23, 89, 94, 29, 95, World::Sand,
+    };
+    if (!world.load_boxes(layout, std::size(layout))) return false;
+    const auto initial = world.status();
+    world.set_sand_sweep_profiling(true);
+    world.step();
+    if (world.sand_sweep_stats().settled_skipped == 0) return false;
+
+    const float pitch = initial.cell_size;
+    const Vec3 focus = Vec3(91.f, 30.f, 92.f) * pitch;
+    world.set_cast_profile(1.f, 1.f);
+    world.set_particle_form(focus, {1.f, 0.f, 0.f}, World::Sand, 1, 2.4f, 1.f);
+    world.step();
+    const auto recruit = world.sand_sweep_stats().form_scanned;
+    if (recruit <= 0 || recruit >= initial.sand || world.particle_form_count() != 120) return false;
+    world.set_particle_form(focus, {1.f, 0.f, 0.f}, World::Sand, 0, 2.4f, 1.f);
+
+    const Vec3 buried = Vec3(36.5f, 20.5f, 36.5f) * pitch;
+    world.set_cast_profile(0.1f, 1.f);
+    world.set_field(buried, true);
+    world.step();
+    const auto sweep = world.sand_sweep_stats();
+    const bool valid = sweep.settled_skipped == 0 && sweep.integrated > 0 && world.status().sand_mass == initial.sand_mass;
+    world.set_sand_sweep_profiling(false);
+    return valid;
+}
+
 static bool sustained_compression(somevoxel::World &world) {
     using somevoxel::Vec3;
     using somevoxel::World;
@@ -352,6 +385,11 @@ int main() {
         return 1;
     }
     std::cout << "External pressure compacted exposed sand only after a simulation step\n";
+    if (!sand_locality(world)) {
+        std::cerr << "Sand locality lost recruitment or failed to wake a disturbed interior\n";
+        return 1;
+    }
+    std::cout << "Sand locality skipped stable interiors and recruited from nearby chunks\n";
     if (!sustained_compression(world)) {
         std::cerr << "Sustained contact failed to distinguish gentle and strong compression\n";
         return 1;

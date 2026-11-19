@@ -161,6 +161,7 @@ private:
     void set_form_voxel(int i, bool formed) {
         Voxel &cell = voxels[i];
         cell.formed = formed;
+        if (formed && cell.kind == Sand) settled_sand_chunks[chunk_at(decode(i))] = false;
         if (cell.kind != Water) return;
         formed_water_count += formed ? 1 : -1;
         ++water_form_revision;
@@ -231,48 +232,7 @@ private:
         whip_mobile_until = 0;
     }
 
-    void recruit_form_particles() {
-        int available_cells = form_capacity() - held_form_cells();
-        const int limit = std::min({available_cells, int(form_motion_limit - form_motion.size()), 120});
-        if (limit <= 0) return;
-
-        form_candidates.clear();
-        const float reach_squared = particle_form.radius * particle_form.radius;
-        const bool whip = particle_form.style == WhipForm;
-        const V3 line = particle_form.point - particle_form.handle;
-        const float inverse_length = whip ? 1.f / std::max(0.000001f, line.length_squared()) : 0.f;
-        const auto consider = [&](int i, int extent) {
-            if (voxels[i].formed || cube_cells(extent) > available_cells) return;
-            const V3 sample = particle_center(decode(i), extent);
-            const float nearest = whip ? std::clamp((sample - particle_form.handle).dot(line) * inverse_length, 0.f, 1.f) : 1.f;
-            const float distance = sample.distance_squared_to(particle_form.handle + line * nearest);
-            if (distance > reach_squared) return;
-            form_candidates.emplace_back(distance, i);
-        };
-        if (particle_form.material == Water) {
-            for (int i : water_positions) consider(i, 1);
-        } else {
-            for (const Grain &grain : grains) consider(grain.position, 1);
-            for (const Grain &grain : gravel) consider(grain.position, grain.extent);
-        }
-        if (int(form_candidates.size()) > limit) {
-            std::nth_element(form_candidates.begin(), form_candidates.begin() + limit, form_candidates.end());
-            form_candidates.resize(limit);
-        }
-        if (particle_form.material == Sand && !gravel.empty())
-            std::sort(form_candidates.begin(), form_candidates.end());
-        for (const auto &candidate : form_candidates) {
-            const int i = candidate.second;
-            const int cells = voxels[i].kind == Gravel ? cube_cells(gravel[voxels[i].occupant].extent) : 1;
-            if (cells > available_cells) continue;
-            FormMotion motion;
-            motion.anchor = form_anchor(uint32_t(i) + tick * 0x9e3779b9u, particle_form.style);
-            motion.style = particle_form.style;
-            if (particle_form.material == Water) ensure_liquid_motion(i);
-            attach_form_motion(i, motion);
-            available_cells -= cells;
-        }
-    }
+    void recruit_form_particles();
 
     void trim_held_form() {
         const int capacity = form_capacity();
@@ -484,6 +444,7 @@ private:
     void apply_sand_throw(Grain &grain, V3 direction, float speed) {
         grain.velocity += direction * speed;
         const I3 p = decode(grain.position);
+        settled_sand_chunks[chunk_at(p)] = false;
         const int edge = grain.extent - 1;
         if (edge == 0) wake_near(p, awake);
         else wake_box(p, p + I3(edge, edge, edge), awake);
