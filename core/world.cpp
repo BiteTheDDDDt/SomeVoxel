@@ -80,7 +80,7 @@ World::FreeSandCandidates World::free_sand_candidates(V3 point) const {
 #ifdef SOMEVOXEL_PARALLEL_WATER_WORKERS
         if (row_count >= 32768 && water_worker_count() > 1) {
             auto &pool = water_solver().worker_pool();
-            constexpr int buckets = 128;
+            static constexpr int buckets = 128;
             const float to_bucket = buckets / reach_squared;
             const auto bucket = [to_bucket](float distance) { return std::min(buckets - 1, int(distance * to_bucket)); };
             std::vector<std::array<size_t, buckets>> histogram(pool.count);
