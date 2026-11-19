@@ -113,7 +113,7 @@ public:
         fire_jet_origin = origin;
         fire_jet_direction = direction / std::sqrt(length_squared);
         fire_jet_radius = std::clamp(radius, 0.045f, 1.25f);
-        fire_jet_strength = std::clamp(strength, 0.1f, 5.f);
+        fire_jet_strength = std::clamp(strength, 0.1f, max_cast_strength);
     }
 
     int fire_jet_count() const { return int(fire_packets.size()); }

@@ -107,6 +107,7 @@ class World {
     static constexpr int max_faces_per_axis = (reference_faces_per_axis * reference_hz + simulation_hz - 1) / simulation_hz;
     static constexpr float maximum_swept_speed = maximum_particle_speed * reference_faces_per_axis;
     static constexpr float gravity = 13.f;
+    static constexpr float max_cast_strength = 10.f;
     static constexpr float sand_density = 1600.f;
     static constexpr int sand_packing_percent = 125;
     static constexpr float rock_density = 2600.f;
@@ -1647,7 +1648,7 @@ public:
     void set_cast_profile(float radius_scale, float strength) {
         if (!std::isfinite(radius_scale) || !std::isfinite(strength)) return;
         const float next_radius = std::clamp(radius_scale, 0.10f, 2.50f);
-        const float next_strength = std::clamp(strength, 0.10f, 5.f);
+        const float next_strength = std::clamp(strength, 0.10f, max_cast_strength);
         if (next_radius != cast_radius_scale || next_strength != cast_strength) {
             const float wake_radius = std::max(cast_radius_scale, next_radius);
             if (pulling) wake_field();
@@ -2146,7 +2147,7 @@ public:
             V3 pressure_source = V3(std::numeric_limits<float>::infinity(), 0, 0)) {
         if (!point.is_finite() || !std::isfinite(radius) || radius <= 0 || radius > 1 ||
                 !std::isfinite(strength) || strength <= 0.f) return 0;
-        strength = std::min(strength, 6.f);
+        strength = std::min(strength, max_cast_strength);
         const I3 lo = grid(point - V3(radius, radius, radius));
         const I3 hi = grid(point + V3(radius, radius, radius));
         std::vector<int> targets;

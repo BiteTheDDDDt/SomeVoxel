@@ -579,7 +579,7 @@ public:
         const V3 right = horizontal.length_squared() > 0.0025f ? horizontal.normalized() : V3(1.f, 0.f, 0.f);
         const bool shrinking = radius < particle_form.radius;
         particle_form = {point, axis, right, axis.cross(right).normalized(), form_half_extents(FormStyle(form), radius),
-            handle, Kind(material), FormStyle(form), radius, std::clamp(strength, 0.1f, 5.f)};
+            handle, Kind(material), FormStyle(form), radius, std::clamp(strength, 0.1f, max_cast_strength)};
         if (shrinking) trim_held_form();
     }
 

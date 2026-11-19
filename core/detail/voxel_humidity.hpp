@@ -231,7 +231,7 @@ public:
         }
         condensation_point = point;
         condensation_radius = std::clamp(radius, 0.18f, 6.f);
-        condensation_strength = std::min(strength, 5.f);
+        condensation_strength = std::min(strength, max_cast_strength);
     }
 
     float humidity_at(V3 point) const {

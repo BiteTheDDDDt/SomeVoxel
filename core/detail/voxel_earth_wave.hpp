@@ -49,7 +49,6 @@ private:
 
     static constexpr float earth_wave_range = 5.5f;
     static constexpr float earth_wave_minimum_strength = 0.045f;
-    static constexpr float earth_wave_maximum_strength = 4.f;
     static constexpr float earth_wave_maximum_radius = 1.30f;
     static constexpr float earth_wave_step_height = 0.20f;
     static constexpr float earth_wave_trace_spacing = 0.145f;
@@ -335,7 +334,7 @@ public:
         if (earth_wave.active || !origin_foot.is_finite() || !target.is_finite() ||
                 !std::isfinite(radius) || !std::isfinite(force) ||
                 radius < scale || radius > earth_wave_maximum_radius ||
-                force <= 0.f || force > earth_wave_maximum_strength) return false;
+                force <= 0.f || force > max_cast_strength) return false;
         V3 direction = target - origin_foot;
         direction.y = 0.f;
         const float distance = std::hypot(direction.x, direction.z);

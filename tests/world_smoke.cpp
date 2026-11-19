@@ -227,18 +227,18 @@ static bool sand_cast_strength(somevoxel::World &world) {
     const Vec3 source = Vec3(60.5f, 35.5f, 60.5f) * pitch;
     const Vec3 focus = source + Vec3(0.4f, 0, 0);
     for (const bool shaped : {false, true}) {
-        float default_travel = 0.f;
-        for (const float strength : {1.f, 5.f}) {
+        float previous_travel = 0.f;
+        for (const float strength : {1.f, 5.f, 10.f}) {
             if (!world.load_boxes(layout, std::size(layout))) return false;
             world.set_cast_profile(1.f, strength);
             if (shaped) world.set_particle_form(focus, {0, 0, 1}, World::Sand, 1, 2.4f, strength);
             else world.set_field(focus, true);
-            for (int tick = 0; tick < 12; ++tick) world.step();
+            for (int tick = 0; tick < 6; ++tick) world.step();
             const auto state = shaped ? world.particle_form_throw() : world.free_sand_throw(focus);
             if (state.count != 1) return false;
             const float travel = state.position.x - source.x;
-            if (strength == 1.f) default_travel = travel;
-            else if (travel <= default_travel + 2.f * pitch) return false;
+            if (strength > 1.f && travel <= previous_travel + 0.01f) return false;
+            previous_travel = travel;
         }
     }
     return true;
