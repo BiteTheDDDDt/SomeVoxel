@@ -21,6 +21,14 @@ var _capacity := 0
 ## to four bytes. Each output row contains four little-endian uint16 heads
 ## in the order of its occupied X runs. Unused entries are zero.
 func solve(rows: PackedByteArray, shape: Vector3i) -> PackedByteArray:
+	return _solve(rows, shape, false)
+
+## Returns one shared byte per row, four bytes per row when runs have
+## different heads, or four uint16 heads for tall water volumes.
+func solve_compact(rows: PackedByteArray, shape: Vector3i) -> PackedByteArray:
+	return _solve(rows, shape, shape.y < 255)
+
+func _solve(rows: PackedByteArray, shape: Vector3i, compact: bool) -> PackedByteArray:
 	var empty := PackedByteArray()
 	for axis in 3:
 		if shape[axis] <= 0 or shape[axis] > MAX_ROWS:
@@ -33,21 +41,32 @@ func solve(rows: PackedByteArray, shape: Vector3i) -> PackedByteArray:
 	if _rd.buffer_update(_buffers[0], 0, rows.size(), rows) != OK:
 		return empty
 	var group_count := ceili(float(count) / GROUP_WIDTH)
-	var groups_x := mini(group_count, DISPATCH_WIDTH)
-	var groups_y := ceili(float(group_count) / DISPATCH_WIDTH)
 	var constants := PackedInt32Array([shape.x, shape.y, shape.z, 0]).to_byte_array()
 	var commands := _rd.compute_list_begin()
 	_rd.compute_list_bind_compute_pipeline(commands, _pipeline)
 	_rd.compute_list_bind_uniform_set(commands, _uniforms, 0)
 	for mode in 4:
-		constants.encode_s32(12, mode)
+		var groups := group_count
+		var publish_compact := compact and mode == 3
+		if publish_compact:
+			groups = ceili(float(count) / (4 * GROUP_WIDTH))
+		constants.encode_s32(12, 4 if publish_compact else mode)
 		_rd.compute_list_set_push_constant(commands, constants, constants.size())
-		_rd.compute_list_dispatch(commands, groups_x, groups_y, 1)
+		_rd.compute_list_dispatch(commands, mini(groups, DISPATCH_WIDTH), ceili(float(groups) / DISPATCH_WIDTH), 1)
 		if mode < 3:
 			_rd.compute_list_add_barrier(commands)
 	_rd.compute_list_end()
 	_rd.submit()
 	_rd.sync()
+	if compact:
+		var aligned := (count + 3) & ~3
+		var shared_heads := _rd.buffer_get_data(_buffers[2], 0, aligned)
+		if shared_heads.size() != aligned:
+			return empty
+		if not shared_heads.has(255):
+			shared_heads.resize(count)
+			return shared_heads
+		return _rd.buffer_get_data(_buffers[2], aligned, count * 4)
 	var heads := _rd.buffer_get_data(_buffers[2], 0, count * HEAD_BYTES_PER_ROW)
 	return heads if heads.size() == count * HEAD_BYTES_PER_ROW else empty
 

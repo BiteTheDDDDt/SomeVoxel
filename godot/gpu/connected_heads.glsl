@@ -3,7 +3,7 @@
 layout(local_size_x = 128) in;
 layout(set=0,binding=0,std430) readonly buffer Rows { uint rows[]; };
 layout(set=0,binding=1,std430) restrict buffer Runs { uvec2 runs[]; };
-layout(set=0,binding=2,std430) restrict buffer Head { uvec2 heads[]; };
+layout(set=0,binding=2,std430) writeonly buffer Head { uint heads[]; };
 layout(push_constant,std430) uniform Parameters { ivec4 shape; };
 
 uint row_mask(uint row) {
@@ -51,13 +51,44 @@ uint resolved_root(uint id) {
     return id;
 }
 
+// One lane owns four adjacent rows so the byte-sized shared heads can be
+// published without atomics. A split between hydraulic components only
+// requires per-run output when those components' actual heights differ.
+void publish_compact(uint group, uint total) {
+    uint first = group * 4u;
+    if (first >= total) return;
+    uint per_run_offset = (total + 3u) / 4u;
+    uint shared_heads = 0u;
+    for (uint lane = 0u; lane < min(4u, total - first); ++lane) {
+        uint row = first + lane;
+        uint count = uint(bitCount(start_mask(row_mask(row))));
+        uint packed = 0u, shared_height = 0u;
+        for (uint run = 0u; run < count; ++run) {
+            uint head = runs[resolved_root(row * 4u + run)].y;
+            packed |= head << (8u * run);
+            if (run == 0u) shared_height = head;
+            else if (head != shared_height) shared_height = 255u;
+        }
+        heads[per_run_offset + row] = packed;
+        shared_heads |= shared_height << (lane * 8u);
+    }
+    heads[group] = shared_heads;
+}
+
 void main() {
     uint row = gl_GlobalInvocationID.x + gl_GlobalInvocationID.y * 16384u * gl_WorkGroupSize.x;
     uint plane = uint(shape.x * shape.z);
+    if (shape.w == 4) {
+        publish_compact(row, plane * uint(shape.y));
+        return;
+    }
     if (row >= plane * uint(shape.y)) return;
     uint mask = row_mask(row);
     if (mask == 0u) {
-        if (shape.w == 3) heads[row] = uvec2(0);
+        if (shape.w == 3) {
+            heads[2u * row] = 0u;
+            heads[2u * row + 1u] = 0u;
+        }
         return;
     }
     uint starts = start_mask(mask);
@@ -86,6 +117,7 @@ void main() {
         uvec2 packed = uvec2(0u);
         for (uint i = 0u; i < count; ++i)
             packed[i >> 1] |= runs[resolved_root(row * 4u + i)].y << ((i & 1u) * 16u);
-        heads[row] = packed;
+        heads[2u * row] = packed.x;
+        heads[2u * row + 1u] = packed.y;
     }
 }

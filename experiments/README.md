@@ -111,6 +111,8 @@ All thread counts produced identical hashes for each fixture. For the dense fixt
 
 ## GPU block cellular automaton
 
+The retired SomeAvatar F10 solver and its replay fixtures are archived alongside this experiment in `gpu_ca/`. To replay an old case, import that Godot project and run `godot --path experiments/gpu_ca --script res://gpu_world_smoke.gd`.
+
 The Vulkan compute probe uses four shifted partitions of disjoint 2×2×2 blocks per tick. Its cells carry IDs. Gravity and the field choose local swaps. Momentum, damage and cross-material exchange are outside the probe's model.
 
 ```sh

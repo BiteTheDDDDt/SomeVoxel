@@ -57,20 +57,72 @@ World::FreeSandCandidates World::free_sand_candidates(V3 point) const {
         for (const Grain &grain : grains)
             consider(candidates.fine, voxels[grain.position], decode(grain.position), grain.extent);
     } else {
-        for (int y = first.y; y <= last.y; ++y) {
-            for (int z = first.z; z <= last.z; ++z) {
-                const int start = flat({first.x / block * block, y, z});
-                for (int base = start, x = first.x / block * block; x <= last.x; base += block, x += block) {
-                    for (unsigned bits = mobile_rows[base / block]; bits != 0; bits &= bits - 1) {
-                        const int lane = next_row_cell(bits, false);
-                        const Voxel &voxel = voxels[base + lane];
-                        if (voxel.kind == Sand) {
-                            consider(candidates.fine, voxel, {x + lane, y, z}, 1);
-                            if (candidates.fine.size() == 2 * fine_limit) trim(candidates.fine, fine_limit);
+        const auto scan = [&](int begin_y, int end_y, auto emit) {
+            for (int y = begin_y; y < end_y; ++y) {
+                for (int z = first.z; z <= last.z; ++z) {
+                    const int start = flat({first.x / block * block, y, z});
+                    for (int base = start, x = first.x / block * block; x <= last.x; base += block, x += block) {
+                        for (unsigned bits = mobile_rows[base / block]; bits != 0; bits &= bits - 1) {
+                            const int lane = next_row_cell(bits, false);
+                            const Voxel &voxel = voxels[base + lane];
+                            if (voxel.kind != Sand || voxel.formed) continue;
+                            const float distance = free_sand_focus_distance_squared(field, particle_center({x + lane, y, z}, 1));
+                            if (distance < reach_squared) emit(distance, voxel.occupant);
                         }
                     }
                 }
             }
+        };
+        const auto append = [&](float distance, int id) {
+            candidates.fine.emplace_back(distance, id);
+            if (candidates.fine.size() == 2 * fine_limit) trim(candidates.fine, fine_limit);
+        };
+#ifdef SOMEVOXEL_PARALLEL_WATER_WORKERS
+        if (row_count >= 32768 && water_worker_count() > 1) {
+            auto &pool = water_solver().worker_pool();
+            constexpr int buckets = 128;
+            const float to_bucket = buckets / reach_squared;
+            const auto bucket = [to_bucket](float distance) { return std::min(buckets - 1, int(distance * to_bucket)); };
+            std::vector<std::array<size_t, buckets>> histogram(pool.count);
+            const int layers = last.y - first.y + 1;
+            const auto visit_band = [&](int worker, auto emit) {
+                scan(first.y + layers * worker / pool.count, first.y + layers * (worker + 1) / pool.count, emit);
+            };
+            pool.run([&](int worker) {
+                visit_band(worker, [&](float distance, int) { ++histogram[worker][bucket(distance)]; });
+            });
+            // Distances in lower buckets are always nearer. Only the bucket
+            // containing the cutoff needs selection by the exact (distance, id).
+            size_t nearer = 0;
+            int cutoff = 0;
+            for (; cutoff < buckets; ++cutoff) {
+                size_t count = 0;
+                for (const auto &counts : histogram) count += counts[cutoff];
+                if (nearer + count > fine_limit) break;
+                nearer += count;
+            }
+            std::vector<size_t> interior_offsets(pool.count + 1), boundary_offsets(pool.count + 1);
+            for (int k = 0; k < pool.count; ++k) {
+                interior_offsets[k + 1] = interior_offsets[k];
+                for (int b = 0; b < cutoff; ++b) interior_offsets[k + 1] += histogram[k][b];
+                boundary_offsets[k + 1] = boundary_offsets[k] + (cutoff < buckets ? histogram[k][cutoff] : 0);
+            }
+            candidates.fine.resize(nearer);
+            decltype(candidates.fine) boundary(boundary_offsets.back());
+            pool.run([&](int worker) {
+                size_t near_index = interior_offsets[worker], boundary_index = boundary_offsets[worker];
+                visit_band(worker, [&](float distance, int id) {
+                    const int index = bucket(distance);
+                    if (index < cutoff) candidates.fine[near_index++] = {distance, id};
+                    else if (index == cutoff) boundary[boundary_index++] = {distance, id};
+                });
+            });
+            trim(boundary, fine_limit - nearer);
+            candidates.fine.insert(candidates.fine.end(), boundary.begin(), boundary.end());
+        } else
+#endif
+        {
+            scan(first.y, last.y + 1, append);
         }
     }
     trim(candidates.fine, fine_limit);

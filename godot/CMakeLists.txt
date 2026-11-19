@@ -30,7 +30,6 @@ install(TARGETS somevoxel_godot
 )
 install(FILES somevoxel.gdextension DESTINATION addons/somevoxel)
 install(FILES presentation/sand_instances.gdshader DESTINATION addons/somevoxel/presentation)
-install(FILES gpu/paged_world.gd gpu/page_layout.gd gpu/material.glsl gpu/dispatch_sizes.glsl gpu/water_pressure.glsl
-    gpu/connected_heads.gd gpu/connected_heads.glsl
+install(FILES gpu/connected_heads.gd gpu/connected_heads.glsl
     DESTINATION addons/somevoxel/gpu)
 install(FILES "${godot_cpp_SOURCE_DIR}/LICENSE.md" DESTINATION addons/somevoxel RENAME godot-cpp-LICENSE.md)

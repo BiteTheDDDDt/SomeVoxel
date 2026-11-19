@@ -1016,18 +1016,21 @@ private:
         }
     }
 
+    void share_sand_contact(Grain &grain, int axis, int direction, int obstacle, I3 attempted) {
+        Grain &other = grains[voxels[obstacle].occupant];
+        if ((grain.velocity[axis] - other.velocity[axis]) * direction > 0.f) {
+            constexpr float mass = particle_mass(Sand, 1);
+            const float shared = (grain.velocity[axis] * mass + other.velocity[axis] * mass) / (mass + mass);
+            grain.velocity[axis] = other.velocity[axis] = shared;
+            next_awake[chunk_at(attempted)] = true;
+        }
+    }
+
     void resolve_granular_contact(Grain &grain, Kind kind, int axis, int direction, int blocking_voxel,
             float kinetic_velocity, bool density_exchange, I3 attempted) {
         if (profile_sand_sweep && kind == Sand) ++sand_sweep.contacts;
         if (kind == Sand && blocking_voxel >= 0 && voxels[blocking_voxel].kind == Sand) {
-            Grain &other = grains[voxels[blocking_voxel].occupant];
-            if ((grain.velocity[axis] - other.velocity[axis]) * direction > 0.f) {
-                // Loose sand has unit extent and carries no packed mass.
-                constexpr float mass = particle_mass(Sand, 1);
-                const float shared_speed = (grain.velocity[axis] * mass + other.velocity[axis] * mass) / (mass + mass);
-                grain.velocity[axis] = other.velocity[axis] = shared_speed;
-                next_awake[chunk_at(attempted)] = true;
-            }
+            share_sand_contact(grain, axis, direction, blocking_voxel, attempted);
             return;
         }
         const bool terrain_impact = !density_exchange && blocking_voxel >= 0 && kinetic_velocity * direction > 2.4f;
@@ -1116,6 +1119,22 @@ private:
         return (surface == Bedrock || terrain_toughness(surface) > 0.f) && !mobile_at(obstacle);
     }
 
+    static float integrate_axis(Grain &grain, int axis, float acceleration, int &direction, float &interval) {
+        float speed = std::clamp(grain.velocity[axis] + acceleration * dt, -maximum_swept_speed, maximum_swept_speed);
+        if (acceleration == 0.f && std::abs(speed) < 0.03f) speed = 0.f;
+        grain.velocity[axis] = speed;
+        const float distance = speed * dt;
+        const float previous = grain.travel[axis];
+        grain.travel[axis] += distance;
+        if (distance == 0.f) return std::numeric_limits<float>::infinity();
+        direction = distance > 0.f ? 1 : -1;
+        const bool resting_face = (grain.blocked_faces & grain_face_bit(axis, direction)) != 0;
+        grain.blocked_faces &= uint8_t(~grain_axis_faces(axis));
+        if (!resting_face && std::abs(grain.travel[axis]) < scale) return std::numeric_limits<float>::infinity();
+        interval = scale / std::abs(distance);
+        return resting_face ? 0.f : (direction * scale - previous) / distance;
+    }
+
     template <typename Fits>
     ParticlePath sweep_particle(Grain &grain, I3 origin, Kind kind, V3 acceleration, Fits fits, FormMotion *form,
             GravelLiquidMove *liquid) {
@@ -1130,25 +1149,9 @@ private:
         V3 crossing(infinity, infinity, infinity), interval;
         I3 direction;
         uint8_t previous_faces = grain.blocked_faces;
-        bool crosses_face = false;
-        for (int axis = 0; axis < 3; ++axis) {
-            float speed = std::clamp<float>(grain.velocity[axis] + acceleration[axis] * dt,
-                -maximum_swept_speed, maximum_swept_speed);
-            if (acceleration[axis] == 0.f && std::abs(speed) < 0.03f) speed = 0.f;
-            grain.velocity[axis] = speed;
-            const float distance = speed * dt;
-            const float previous = grain.travel[axis];
-            grain.travel[axis] += distance;
-            if (distance == 0.f) continue;
-            direction[axis] = distance > 0.f ? 1 : -1;
-            const bool resting_face = (previous_faces & grain_face_bit(axis, direction[axis])) != 0;
-            grain.blocked_faces &= uint8_t(~grain_axis_faces(axis));
-            if (!resting_face && std::abs(grain.travel[axis]) < scale) continue;
-            crosses_face = true;
-            crossing[axis] = resting_face ? 0.f : (direction[axis] * scale - previous) / distance;
-            interval[axis] = scale / std::abs(distance);
-        }
-        if (!crosses_face) return {origin, origin};
+        for (int axis = 0; axis < 3; ++axis)
+            crossing[axis] = integrate_axis(grain, axis, acceleration[axis], direction[axis], interval[axis]);
+        if (crossing == V3(infinity, infinity, infinity)) return {origin, origin};
 
         I3 position = origin;
         // The bound covers every face reached at the supported maximum
@@ -1213,6 +1216,54 @@ private:
         return {position, origin};
     }
 
+    // Inside a solid volume of loose sand, all three attempted faces are
+    // blocked for this entire grain update. Normal contact changes only its
+    // own axis. Apply those contacts directly in the existing grain order.
+    bool step_enclosed_sand(Grain &grain, I3 p, V3 acceleration, bool attracted) {
+        if (p.x == 0 || p.x == nx - 1 || p.y == 0 || p.y == ny - 1 || p.z == 0 || p.z == nz - 1)
+            return false;
+        const int i = grain.position;
+        if (voxels[i - 1].kind != Sand || voxels[i + 1].kind != Sand ||
+                voxels[i - nx].kind != Sand || voxels[i + nx].kind != Sand ||
+                voxels[i - slice].kind != Sand || voxels[i + slice].kind != Sand)
+            return false;
+
+        if (grain.velocity.y <= 0.f && acceleration.y <= 0.f) {
+            grain.travel.y = 0.f;
+            grain.blocked_faces &= uint8_t(~grain_axis_faces(1));
+            if (grain.velocity.y < -0.3f) {
+                if (profile_sand_sweep) ++sand_sweep.contacts;
+                share_sand_contact(grain, 1, -1, i - slice, p + I3(0, -1, 0));
+            } else {
+                grain.velocity.y = 0.f;
+            }
+            acceleration.y = 0.f;
+            if (!attracted) {
+                const float retention = step_ground_retention(Sand, granular_material(Sand).ground_retention);
+                grain.velocity.x *= retention;
+                grain.velocity.z *= retention;
+            }
+        }
+        if (grain.velocity == V3() && acceleration == V3()) return true;
+        constexpr int stride[] = {1, slice, nx};
+        for (int axis = 0; axis < 3; ++axis) {
+            int direction = 0;
+            float interval;
+            if (integrate_axis(grain, axis, acceleration[axis], direction, interval) > 1.000001f) continue;
+            I3 attempted = p;
+            attempted[axis] += direction;
+            if (profile_sand_sweep) {
+                ++sand_sweep.tested_faces;
+                ++sand_sweep.contacts;
+            }
+            share_sand_contact(grain, axis, direction, i + stride[axis] * direction, attempted);
+            grain.travel[axis] = 0.f;
+        }
+        if (grain.velocity.length_squared() > 0.0009f || (acceleration.length_squared() > 0.01f && attracted))
+            next_awake[chunk_at(p)] = true;
+        return true;
+    }
+
     // Integrate forces at a fixed rate. Sub-cell displacement accumulates
     // until a face crossing can be committed to the shared occupancy grid.
     template <typename Fits>
@@ -1261,6 +1312,8 @@ private:
                 acceleration += relative_wind * (2.f * drag * pressure);
             }
         }
+        if (kind == Sand && !form && airborne_earth_ejecta.empty() && step_enclosed_sand(grain, from, acceleration, attracted))
+            return {from, from};
         I3 slope;
         int support = -1;
         if (grain.velocity.y <= 0.f && acceleration.y <= 0.f && !fits(from + down, &support) &&

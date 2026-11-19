@@ -105,6 +105,8 @@ public:
 
     explicit WaterSpans(int count) : workers(count) {}
 
+    HeadWorkers &worker_pool() { return workers; }
+
     template <typename Apply> void rebuild(const std::vector<int> &water_positions, Apply apply) {
         if (water_positions.empty()) return;
         const int highest = *std::max_element(water_positions.begin(), water_positions.end());
@@ -286,10 +288,14 @@ public:
                 + cell / 8 % x_rows - box.x0;
             accelerator_masks[row] |= uint8_t(1u << (cell & 7));
         }
-        if (!accelerate(accelerator_masks, width, levels, depth, accelerator_heads)
-                || accelerator_heads.size() != count * 8) return false;
+        if (!accelerate(accelerator_masks, width, levels, depth, accelerator_heads)) return false;
+        const size_t bytes_per_row = accelerator_heads.size() / count;
+        if ((bytes_per_row != 1 && bytes_per_row != 4 && bytes_per_row != 8)
+                || accelerator_heads.size() != count * bytes_per_row) return false;
 
         const auto head_at = [&](size_t row, int run) {
+            if (bytes_per_row == 1) return int(accelerator_heads[row]);
+            if (bytes_per_row == 4) return int(accelerator_heads[row * 4 + run]);
             const size_t offset = row * 8 + run * 2;
             return int(accelerator_heads[offset]) | (int(accelerator_heads[offset + 1]) << 8);
         };

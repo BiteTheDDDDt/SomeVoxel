@@ -1,7 +1,7 @@
 extends SceneTree
 
-const World = preload("res://addons/somevoxel/gpu/paged_world.gd")
-const Layout = preload("res://addons/somevoxel/gpu/page_layout.gd")
+const World = preload("paged_world.gd")
+const Layout = preload("page_layout.gd")
 
 var failed := false
 

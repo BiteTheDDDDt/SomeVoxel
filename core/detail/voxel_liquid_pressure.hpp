@@ -68,7 +68,7 @@ private:
     std::vector<LiquidHead> previous_water_heads;
 #ifdef SOMEVOXEL_PARALLEL_WATER_WORKERS
     using PackedWaterSpans = WaterSpans<nx, ny, nz>;
-    std::unique_ptr<PackedWaterSpans> water_spans;
+    mutable std::unique_ptr<PackedWaterSpans> water_spans;
     typename PackedWaterSpans::Surfaces pressure_surfaces;
     int64_t pressure_surface_version = -1;
     int requested_water_workers = -1;
@@ -76,6 +76,11 @@ private:
     int64_t accelerated_head_rebuilds = 0;
     int64_t accelerator_attempts = 0;
     int64_t accelerator_time_us = 0;
+
+    PackedWaterSpans &water_solver() const {
+        if (!water_spans) water_spans = std::make_unique<PackedWaterSpans>(water_worker_count());
+        return *water_spans;
+    }
 #endif
     std::vector<int> pressure_component;
     std::vector<PressureNode> pressure_nodes;
@@ -235,9 +240,7 @@ private:
 #ifdef SOMEVOXEL_PARALLEL_WATER_WORKERS
         const bool use_rows = size_t(water_scan_end / block) <= 4 * water_positions.size();
         if (water_positions.size() >= 16384 && (!balance || use_rows)) {
-            if (!water_spans) {
-                water_spans = std::make_unique<PackedWaterSpans>(water_worker_count());
-            }
+            auto &solver = water_solver();
             const auto apply_head = [this](int i, int width, int head) {
                 const I3 p = decode(i);
                 if (liquid_head.publish(p, width, LiquidHead(head))) {
@@ -253,13 +256,13 @@ private:
                     if (can_publish(pressure_surfaces)) return;
                 } else {
                     pressure_surface_version = water_topology_version;
-                    if (water_spans->try_pressure_rows(bulk_water_rows, liquid_motion, water_scan_end / slice,
+                    if (solver.try_pressure_rows(bulk_water_rows, liquid_motion, water_scan_end / slice,
                             pressure_surfaces, apply_head, can_publish)) return;
                 }
             } else {
                 if (water_head_accelerator && water_positions.size() >= 1000000) {
                     const auto start = std::chrono::steady_clock::now();
-                    const bool solved = water_spans->try_accelerated_rows(bulk_water_rows, liquid_motion,
+                    const bool solved = solver.try_accelerated_rows(bulk_water_rows, liquid_motion,
                         water_scan_end / slice, water_head_accelerator, apply_head);
                     ++accelerator_attempts;
                     accelerator_time_us += std::chrono::duration_cast<std::chrono::microseconds>(
@@ -270,8 +273,8 @@ private:
                     }
                 }
                 // Sparse scenes benefit from visiting just their parcel list.
-                if (use_rows) water_spans->rebuild_rows(bulk_water_rows, liquid_motion, water_scan_end / slice, apply_head);
-                else water_spans->rebuild(water_positions, apply_head);
+                if (use_rows) solver.rebuild_rows(bulk_water_rows, liquid_motion, water_scan_end / slice, apply_head);
+                else solver.rebuild(water_positions, apply_head);
                 return;
             }
         }

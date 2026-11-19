@@ -166,18 +166,21 @@ public:
                 previous_rows <= padded + std::max(padded / 2, 4))
             rows = previous_rows;
         constexpr I3 bits(coordinate_bits(nx), coordinate_bits(ny), coordinate_bits(nz));
-        godot::PackedFloat32Array data;
-        data.resize(rows * width * 4);
-        float *cells = data.ptrw();
-        const auto write_grain = [&](float *out, const Grain &grain, int index, int style) {
+        constexpr size_t texel_bytes = 4 * sizeof(float);
+        godot::PackedByteArray data;
+        if (data.resize(size_t(rows) * width * texel_bytes) != godot::OK) return {};
+        uint8_t *cells = data.ptrw();
+        const auto write_grain = [&](size_t instance, const Grain &grain, int index, int style) {
             const I3 current = decode(grain.position);
             const I3 previous = grain_interpolates(grain) ? decode(grain.previous) : current;
-            write_sand_texel(out, current, previous, bits, index, style);
+            float texel[4];
+            write_sand_texel(texel, current, previous, bits, index, style);
+            std::memcpy(cells + instance * texel_bytes, texel, sizeof(texel));
         };
         const auto pack_sand = [&](int start, int end) {
             for (int i = start; i < end; ++i) {
                 const int index = cull ? visible_sand[i] : i;
-                write_grain(cells + size_t(i) * 4, grains[index], index, 0);
+                write_grain(i, grains[index], index, 0);
             }
         };
 #ifdef SOMEVOXEL_PARALLEL_RENDER_WORKERS
@@ -193,13 +196,15 @@ public:
         for (int i = 0; i < int(gravel.size()); ++i) {
             const Grain &grain = gravel[i];
             const int style = (grain.extent == 8 ? 3 : grain.extent == 4 ? 2 : 1) | (grain.sand_units ? 4 : 0);
-            write_grain(cells + size_t(sand_count + i) * 4, grain, i, style);
+            write_grain(sand_count + i, grain, i, style);
         }
+        if (rows * width > count)
+            std::memset(cells + size_t(count) * texel_bytes, 0, size_t(rows * width - count) * texel_bytes);
         godot::Array result;
         result.push_back(count);
         result.push_back(width);
         result.push_back(rows);
-        result.push_back(data.to_byte_array());
+        result.push_back(data);
         result.push_back(godot::Vector3i(bits.x, bits.y, bits.z));
         return result;
     }
