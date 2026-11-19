@@ -63,6 +63,51 @@ static bool communicating_vessels(somevoxel::World &world) {
         world.range_count(water, {129, 4, 65}, {193, 24, 128}) == 64 * 14 * 63;
 }
 
+static bool loaded_sand_fractures(somevoxel::World &world) {
+    using somevoxel::World;
+    const int32_t layout[] = {
+        0, 0, 0, 140, 4, 140, World::Stone,
+        70, 4, 48, 72, 32, 72, World::Stone,
+    };
+    if (!world.load_boxes(layout, std::size(layout))) return false;
+    const float pitch = world.status().cell_size;
+    const float mass = World::packed_particle_mass(2);
+    const auto id = world.spawn_packed_particle({52.f * pitch, 15.f * pitch, 60.f * pitch},
+        2, {mass * 22.f, 0.f, 0.f});
+    if (!id) return false;
+    const auto before = world.status();
+    for (int i = 0; i < 24; ++i) world.step();
+    const auto after = world.status();
+    return !world.packed_particle_state(id) && after.sand == 8 &&
+        after.sand_mass == before.sand_mass && after.sand_volume == before.sand_volume;
+}
+
+static bool loaded_sand_compacts(somevoxel::World &world) {
+    using somevoxel::World;
+    const int32_t layout[] = {
+        0, 0, 0, 120, 4, 120, World::Stone,
+        60, 4, 60, 62, 6, 62, World::Sand,
+        62, 4, 60, 63, 6, 61, World::Sand,
+        63, 4, 59, 66, 9, 64, World::Stone,
+        59, 4, 59, 63, 7, 60, World::Stone,
+        59, 4, 62, 63, 7, 63, World::Stone,
+    };
+    const float pitch = world.status().cell_size;
+    const float mass = World::packed_particle_mass(2);
+    for (const bool strong : {false, true}) {
+        if (!world.load_boxes(layout, std::size(layout))) return false;
+        const float speed = strong ? 22.f : 2.f;
+        if (!world.spawn_packed_particle({58.5f * pitch, 5.f * pitch, 61.f * pitch},
+                2, {mass * speed, 0.f, 0.f})) return false;
+        const auto before = world.status();
+        world.step();
+        const auto after = world.status();
+        if (after.sand_mass != before.sand_mass || after.packed_sand_blocks != int(strong) ||
+                after.sand_volume != before.sand_volume - 2 * int(strong)) return false;
+    }
+    return true;
+}
+
 int main() {
     if (!water_head_selection()) {
         std::cerr << "Water head backend selection or GPU failure recovery failed\n";
@@ -128,4 +173,14 @@ int main() {
         return 1;
     }
     std::cout << "Communicating vessels conserved water and raised the receiving chamber\n";
+    if (!loaded_sand_fractures(world)) {
+        std::cerr << "A packed body failed to fracture from contact or lost mass\n";
+        return 1;
+    }
+    std::cout << "A contact fractured a packed projectile and conserved its sand\n";
+    if (!loaded_sand_compacts(world)) {
+        std::cerr << "Compaction did not distinguish weak and strong contact loads\n";
+        return 1;
+    }
+    std::cout << "Only the strong contact compacted sand, preserving its mass\n";
 }

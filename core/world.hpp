@@ -171,6 +171,10 @@ private:
         Grain(int from, int to, uint32_t updated, int width = 1, V3 speed = V3(), V3 offset = V3()) :
             previous(from), position(to), moved(updated), extent(uint8_t(width)), velocity(speed), travel(offset) {}
     };
+    struct MaterialLoad {
+        float work;
+        V3 impulse;
+    };
     static_assert(sizeof(Grain) == 16 + 2 * sizeof(V3));
     struct GravelLiquidMove {
         std::array<int, 8 * 8> sources, exits;
@@ -905,6 +909,16 @@ private:
         if (!sand_tile_dirty.empty()) mark_gravel_tile(decode(gravel[id].position));
         if (!airborne_earth_ejecta.empty()) airborne_earth_ejecta.erase(gravel[id].position);
         const int last = int(gravel.size()) - 1;
+        if (!packed_strain.empty()) {
+            packed_strain.erase(id);
+            if (id != last) {
+                auto entry = packed_strain.extract(last);
+                if (entry) {
+                    entry.key() = id;
+                    packed_strain.insert(std::move(entry));
+                }
+            }
+        }
         for (auto it = tracked_packed_particles.begin(); it != tracked_packed_particles.end();) {
             if (it->second == id) {
                 it = tracked_packed_particles.erase(it);
@@ -1066,8 +1080,11 @@ private:
 
     void share_sand_contact(Grain &grain, int axis, int direction, int obstacle, I3 attempted) {
         Grain &other = grains[voxels[obstacle].occupant];
-        if ((grain.velocity[axis] - other.velocity[axis]) * direction > 0.f) {
+        const float relative_speed = (grain.velocity[axis] - other.velocity[axis]) * direction;
+        if (relative_speed > 0.f) {
             constexpr float mass = particle_mass(Sand, 1);
+            if (relative_speed >= minimum_sand_compaction_speed)
+                record_compaction_load(attempted, {0.125f * mass * relative_speed * relative_speed, {}});
             const float shared = (grain.velocity[axis] * mass + other.velocity[axis] * mass) / (mass + mass);
             grain.velocity[axis] = other.velocity[axis] = shared;
             next_awake[chunk_at(attempted)] = true;
@@ -1089,6 +1106,10 @@ private:
         };
         if (terrain_impact && kind == Gravel &&
                 record_gravel_terrain_contacts(attempted, kinetic_projectile(), axis, direction)) {
+            const float momentum = particle_mass(kind, grain) * std::abs(kinetic_velocity);
+            // The rigid side and the projectile each absorb a fraction of the
+            // incident work. The remaining normal energy is dissipated.
+            record_packed_load(voxels[grain.position].occupant, {0.02f * momentum * std::abs(kinetic_velocity), {}});
             grain.velocity[axis] = 0.f;
             return;
         }
@@ -1110,6 +1131,15 @@ private:
         // Occupancy is still committed separately through the face test.
         const float mass = particle_mass(kind, grain);
         const float other_mass = particle_mass(voxels[blocking_voxel].kind, *other);
+        const Kind other_kind = voxels[blocking_voxel].kind;
+        if (kind == Gravel || other_kind == Gravel) {
+            const float reduced_mass = mass * other_mass / (mass + other_mass);
+            const float lost_energy = 0.5f * reduced_mass * relative_speed * relative_speed;
+            const MaterialLoad fracture{0.12f * lost_energy, {}};
+            if (kind == Gravel) record_packed_load(voxels[grain.position].occupant, fracture);
+            if (other_kind == Gravel) record_packed_load(voxels[blocking_voxel].occupant, fracture);
+            if (other_kind == Sand) record_compaction_load(decode(blocking_voxel), {0.50f * lost_energy, {}});
+        }
         const float shared_speed = (grain.velocity[axis] * mass + other->velocity[axis] * other_mass)
             / (mass + other_mass);
         grain.velocity[axis] = shared_speed;
@@ -1972,6 +2002,13 @@ private:
 
 public:
     int compact(V3 point, float radius, int extent = 2) {
+        if (!std::isfinite(radius)) return 0;
+        const float available_work = (4.f / 3.f) * 3.14159265f * radius * radius * radius * 3000.f * cast_strength;
+        return compact_with_work(point, radius, extent, {available_work, {}});
+    }
+
+private:
+    int compact_with_work(V3 point, float radius, int extent, MaterialLoad load) {
         if (!point.is_finite() || !std::isfinite(radius) || radius <= 0 || radius > 1 ||
                 (extent != 2 && extent != 4 && extent != 8)) return 0;
         const V3 reach(radius, radius, radius);
@@ -1981,6 +2018,7 @@ public:
         const I3 corner(extent - 1, extent - 1, extent - 1);
         const int mass_goal = cube_cells(extent) * sand_packing_percent / 100;
         const float radius_squared = radius * radius;
+        float work_remaining = load.work;
         std::vector<std::pair<float, int>> candidates;
         for (int y = std::max(0, lo.y & align); y <= std::min(ny - extent, hi.y); y += extent)
             for (int z = std::max(0, lo.z & align); z <= std::min(nz - extent, hi.z); z += extent)
@@ -2023,6 +2061,11 @@ public:
             if (!full || !gather_gravel_shell(p, extent, mass_goal - mass_units, donors, [&](I3 q) {
                     return kind_at(q) == Sand && center(q).distance_squared_to(point) <= radius_squared;
                 })) continue;
+            // A pressure source must do work against the material's
+            // compaction resistance before the occupancy can change.
+            const float work = sand_compaction_work(extent, int(donors.size()));
+            if (work > work_remaining) continue;
+            work_remaining -= work;
 
             for (int i : donors) {
                 momentum += grains[voxels[i].occupant].velocity;
@@ -2046,23 +2089,29 @@ public:
         return made;
     }
 
-    void apply_impact_impulse(Grain &grain, Kind kind, V3 point, float radius, float force = 1.f) {
+    MaterialLoad apply_impact_impulse(Grain &grain, Kind kind, V3 point, float radius, float force = 1.f,
+            float fracture_fraction = 0.f) {
         const I3 p = decode(grain.position);
         const V3 relative = particle_center(p, grain.extent) - point;
         const float distance_squared = relative.length_squared();
-        if (distance_squared > radius * radius) return;
+        if (distance_squared > radius * radius) return {};
         const float distance = std::sqrt(distance_squared);
         const float strength = force * (2.8f + 3.6f * (1.f - distance / radius));
         V3 direction = distance > 0.0001f ? relative / distance : V3();
         direction.y += 1.15f;
         const float effective_width = scale * grain.extent;
         const float impulse = strength * sand_density * scale * effective_width * effective_width;
-        grain.velocity += direction * (impulse / particle_mass(kind, grain));
+        const float mass = particle_mass(kind, grain);
+        const V3 kick = direction * (impulse / mass);
+        const float fracture_work = 0.5f * impulse * strength * fracture_fraction;
+        grain.velocity += kick * std::sqrt(1.f - fracture_fraction);
         for (int axis = 0; axis < 3; ++axis)
             grain.velocity[axis] = std::clamp<float>(grain.velocity[axis], -maximum_swept_speed, maximum_swept_speed);
         wake_near(p, awake);
+        return {fracture_work, {}};
     }
 
+public:
     int impact(V3 point, float radius, float strength = 1.f,
             V3 pressure_source = V3(std::numeric_limits<float>::infinity(), 0, 0)) {
         if (!point.is_finite() || !std::isfinite(radius) || radius <= 0 || radius > 1 ||
@@ -2108,63 +2157,13 @@ public:
                 }
         std::sort(targets.begin(), targets.end());
         targets.erase(std::unique(targets.begin(), targets.end()), targets.end());
-        int broken = 0;
-        std::vector<int> overflow;
         for (int origin : targets) {
             const int id = voxels[origin].occupant;
-            const Grain grain = gravel[id];
-            const int extent = grain.extent;
-            const I3 start = decode(origin);
-            const int mass_units = gravel_mass_units(grain);
-            if (grain.sand_units) {
-                const V3 low = V3(start) * scale;
-                const V3 width(extent * scale, extent * scale, extent * scale);
-                const float distance = point.distance_to(point.clamp(low, low + width));
-                const float stress = strength * std::max(0.f, 1.f - 0.65f * distance / radius);
-                const bool fractures = stress >= 0.70f * gravel_density_ratio(grain);
-                const bool space = extent > 2 || (fractures && gather_gravel_shell(start, extent,
-                    mass_units - cube_cells(extent), overflow, [&](I3 p) {
-                        const int i = flat(p);
-                        return voxels[i].kind == Empty && !body_at(i);
-                    }));
-                if (!fractures || !space) {
-                    apply_impact_impulse(gravel[id], Gravel, point, radius, strength);
-                    continue;
-                }
-            } else {
-                overflow.clear();
-            }
-            erase_gravel(id);
-            if (extent == 2) {
-                invalidate_support_above(start, extent);
-                const auto release = [&](int i) {
-                    voxels[i] = {Sand, voxel_stamp, int(grains.size())};
-                    grains.push_back({i, i, tick, 1, grain.velocity});
-                    if (!sand_tile_dirty.empty()) mark_sand_tiles(decode(i));
-                    queue_sand_contact(i);
-                    set_mobile(i, true);
-                    apply_impact_impulse(grains.back(), Sand, point, radius, strength);
-                    wake_near(decode(i), awake);
-                };
-                each_cube(origin, extent, release);
-                for (int i : overflow) release(i);
-            } else {
-                const int half = extent / 2;
-                for (int offset : gravel_offsets()) {
-                    const int child = origin + half * offset;
-                    const int child_id = int(gravel.size());
-                    gravel.push_back({child, child, tick, half, grain.velocity});
-                    if (grain.sand_units) gravel.back().sand_units = uint16_t(mass_units / 8);
-                    if (!sand_tile_dirty.empty()) mark_gravel_tile(decode(child));
-                    apply_impact_impulse(gravel.back(), Gravel, point, radius, strength);
-                    each_cube(child, half, [&](int i) { voxels[i] = {Gravel, voxel_stamp, child_id}; });
-                }
-            }
-            wake_box(start, start + I3(extent - 1, extent - 1, extent - 1), awake);
-            ++broken;
+            Grain &grain = gravel[id];
+            record_packed_load(id, apply_impact_impulse(grain, Gravel, point, radius, strength, 0.62f));
         }
-        if (broken) ++sand_revision;
-        return broken + apply_surface_pulse(surface_contacts, surface_weight, pressure_source, strength);
+        const int packed_breaks = finish_packed_fractures();
+        return packed_breaks + apply_surface_pulse(surface_contacts, surface_weight, pressure_source, strength);
     }
 
     int grain_count() const { return int(grains.size() + gravel.size()); }

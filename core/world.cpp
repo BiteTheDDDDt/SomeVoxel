@@ -402,6 +402,8 @@ void World::step() {
             std::chrono::steady_clock::now() - sweep_start).count();
     }
     awake = next_awake;
+    finish_packed_fractures();
+    finish_contact_compaction();
     finish_terrain_fractures();
     step_earth_wave();
     step_fire_jet();

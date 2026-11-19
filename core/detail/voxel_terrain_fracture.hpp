@@ -1,10 +1,13 @@
 private:
-    struct TerrainStrain {
-        Kind material = Empty;
+    struct LoadHistory {
         float energy = 0.f;
         V3 impulse;
         uint32_t last_contact = 0;
         bool queued = false;
+    };
+
+    struct TerrainStrain : LoadHistory {
+        Kind material = Empty;
     };
 
     struct TerrainImpactPeak {
@@ -15,6 +18,9 @@ private:
     static constexpr size_t terrain_strain_limit = 8192;
     std::unordered_map<int, TerrainStrain> terrain_strain;
     std::vector<int> terrain_fracture_jobs;
+    std::unordered_map<int, LoadHistory> packed_strain;
+    std::vector<int> packed_fracture_jobs;
+    std::vector<std::pair<int, float>> compaction_jobs;
     std::array<int, Char + 1> terrain_contact_breaks{};
     std::array<TerrainImpactPeak, Char + 1> terrain_impact_peaks{};
 
@@ -33,6 +39,9 @@ private:
     void reset_terrain_fractures() {
         terrain_strain.clear();
         terrain_fracture_jobs.clear();
+        packed_strain.clear();
+        packed_fracture_jobs.clear();
+        compaction_jobs.clear();
         terrain_contact_breaks.fill(0);
         terrain_impact_peaks.fill({});
     }
@@ -56,29 +65,81 @@ private:
 
         V3 impulse;
         impulse[axis] = direction * local_impulse;
-        add_terrain_strain(index, material, toughness, work, impulse);
+        add_terrain_strain(index, material, toughness, {work, impulse});
     }
 
-    void add_terrain_strain(int index, Kind material, float toughness, float work, V3 impulse) {
-        auto entry = terrain_strain.find(index);
-        if (entry == terrain_strain.end()) {
-            if (terrain_strain.size() >= terrain_strain_limit) return;
-            entry = terrain_strain.emplace(index, TerrainStrain{}).first;
-        }
-        TerrainStrain &strain = entry->second;
-        if (strain.material != material) strain = {material, 0.f, V3(), tick, false};
+    bool accumulate_load(LoadHistory &strain, MaterialLoad load, float resistance) {
         if (strain.last_contact != tick) {
             const float seconds = (tick - strain.last_contact) * dt;
             strain.energy *= std::exp(-1.10f * seconds);
             strain.impulse = {};
             strain.last_contact = tick;
         }
-        strain.energy += work;
-        strain.impulse += impulse;
-        if (strain.energy >= toughness && !strain.queued) {
-            strain.queued = true;
-            terrain_fracture_jobs.push_back(index);
+        strain.energy += load.work;
+        strain.impulse += load.impulse;
+        if (strain.queued || strain.energy < resistance) return false;
+        strain.queued = true;
+        return true;
+    }
+
+    static float packed_fracture_work(const Grain &grain) {
+        // Breaking creates an internal surface. Use physical area and a
+        // higher work per square metre for compressed sand.
+        const float edge = grain.extent * scale;
+        return edge * edge * (grain.sand_units ? 760.f : 330.f);
+    }
+
+    static constexpr float sand_compaction_work(int extent, int donors) {
+        return scale * scale * scale * (1000.f * extent * extent * extent + 24000.f * donors);
+    }
+
+    // At this relative speed, a pair of loose grains can supply the minimum
+    // compaction work from half of their dissipated normal kinetic energy.
+    static constexpr float minimum_sand_compaction_speed = 16.73f;
+
+    void record_compaction_load(I3 contact, MaterialLoad load) {
+        if (load.work < sand_compaction_work(2, 2) || compaction_jobs.size() >= 64) return;
+        const I3 anchor(contact.x & ~1, contact.y & ~1, contact.z & ~1);
+        compaction_jobs.emplace_back(flat(anchor), load.work);
+    }
+
+    void finish_contact_compaction() {
+        if (compaction_jobs.empty()) return;
+        std::stable_sort(compaction_jobs.begin(), compaction_jobs.end(),
+            [](const auto &a, const auto &b) { return a.first < b.first; });
+        for (size_t i = 0; i < compaction_jobs.size();) {
+            const auto [anchor, initial_work] = compaction_jobs[i++];
+            float work = initial_work;
+            while (i < compaction_jobs.size() && compaction_jobs[i].first == anchor) work += compaction_jobs[i++].second;
+            const I3 site = decode(anchor);
+            compact_with_work(particle_center(site, 2), std::min(1.f, 1.7f * scale), 2, {work, {}});
         }
+        compaction_jobs.clear();
+    }
+
+    void record_packed_load(int id, MaterialLoad load) {
+        const float resistance = packed_fracture_work(gravel[id]);
+        if (load.work < 0.018f * resistance) return;
+        auto it = packed_strain.find(id);
+        if (it == packed_strain.end()) {
+            if (packed_strain.size() >= terrain_strain_limit) return;
+            it = packed_strain.emplace(id, LoadHistory{}).first;
+        }
+        if (accumulate_load(it->second, load, resistance)) packed_fracture_jobs.push_back(id);
+    }
+
+    void add_terrain_strain(int index, Kind material, float toughness, MaterialLoad load) {
+        auto entry = terrain_strain.find(index);
+        if (entry == terrain_strain.end()) {
+            if (terrain_strain.size() >= terrain_strain_limit) return;
+            entry = terrain_strain.emplace(index, TerrainStrain{}).first;
+        }
+        TerrainStrain &strain = entry->second;
+        if (strain.material != material) {
+            strain = {};
+            strain.material = material;
+        }
+        if (accumulate_load(strain, load, toughness)) terrain_fracture_jobs.push_back(index);
     }
 
     int apply_surface_pulse(const std::vector<std::pair<int, float>> &contacts, float total_weight,
@@ -94,7 +155,7 @@ private:
             if (work < 0.018f * toughness) continue;
             const float mass = particle_mass(kind == Stone ? Rock : kind, 1);
             const V3 direction = (center(decode(index)) - source).normalized();
-            add_terrain_strain(index, kind, toughness, work, direction * std::sqrt(2.f * mass * work));
+            add_terrain_strain(index, kind, toughness, {work, direction * std::sqrt(2.f * mass * work)});
         }
         return finish_terrain_fractures();
     }
@@ -123,6 +184,66 @@ private:
         for (int i = 0; i < bearing_count; ++i)
             record_terrain_contact(bearing[i], projectile, Gravel, axis, direction, bearing_count);
         return bearing_count != 0;
+    }
+
+    bool split_packed_body(int id, std::vector<int> &overflow) {
+        const Grain grain = gravel[id];
+        const int extent = grain.extent;
+        const int origin = grain.position;
+        const I3 start = decode(origin);
+        const int mass_units = gravel_mass_units(grain);
+        if (extent == 2 && !gather_gravel_shell(start, extent, mass_units - cube_cells(extent), overflow,
+                [&](I3 p) { return voxels[flat(p)].kind == Empty && !body_at(flat(p)); })) return false;
+
+        erase_gravel(id);
+        if (extent == 2) {
+            invalidate_support_above(start, extent);
+            const auto release = [&](int i) {
+                voxels[i] = {Sand, voxel_stamp, int(grains.size())};
+                grains.push_back({i, i, tick, 1, grain.velocity});
+                if (!sand_tile_dirty.empty()) mark_sand_tiles(decode(i));
+                queue_sand_contact(i);
+                set_mobile(i, true);
+                wake_near(decode(i), awake);
+            };
+            each_cube(origin, extent, release);
+            for (int i : overflow) release(i);
+        } else {
+            const int half = extent / 2;
+            for (int offset : gravel_offsets()) {
+                const int child = origin + half * offset;
+                const int child_id = int(gravel.size());
+                gravel.push_back({child, child, tick, half, grain.velocity});
+                if (grain.sand_units) gravel.back().sand_units = uint16_t(mass_units / 8);
+                if (!sand_tile_dirty.empty()) mark_gravel_tile(decode(child));
+                each_cube(child, half, [&](int i) { voxels[i] = {Gravel, voxel_stamp, child_id}; });
+            }
+        }
+        wake_box(start, start + I3(extent - 1, extent - 1, extent - 1), awake);
+        return true;
+    }
+
+    int finish_packed_fractures() {
+        int fractured = 0;
+        if (!packed_fracture_jobs.empty()) {
+            // Erasing a packed body swaps in the last ID. Descending order
+            // keeps every unprocessed job pointed at its original body.
+            std::sort(packed_fracture_jobs.rbegin(), packed_fracture_jobs.rend());
+            std::vector<int> overflow;
+            for (int id : packed_fracture_jobs) {
+                if (split_packed_body(id, overflow)) ++fractured;
+                else packed_strain.at(id).queued = false;
+            }
+            packed_fracture_jobs.clear();
+            if (fractured) ++sand_revision;
+        }
+        if (!packed_strain.empty() && tick % uint32_t(simulation_hz) == 0) {
+            for (auto entry = packed_strain.begin(); entry != packed_strain.end();) {
+                if (tick - entry->second.last_contact >= 3 * simulation_hz) entry = packed_strain.erase(entry);
+                else ++entry;
+            }
+        }
+        return fractured;
     }
 
     int finish_terrain_fractures() {
