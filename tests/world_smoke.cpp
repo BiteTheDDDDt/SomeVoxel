@@ -108,6 +108,31 @@ static bool loaded_sand_compacts(somevoxel::World &world) {
     return true;
 }
 
+static bool pressure_api(somevoxel::World &world) {
+    using somevoxel::Vec3;
+    using somevoxel::World;
+    const int32_t shell[] = {
+        53, 7, 53, 59, 13, 59, World::Stone,
+        54, 8, 54, 56, 10, 56, World::Sand,
+        56, 8, 54, 57, 10, 55, World::Sand,
+    };
+    const Vec3 point = Vec3(55.f, 9.f, 55.f) * world.status().cell_size;
+    for (const bool sealed : {false, true}) {
+        const auto *layout = shell + (sealed ? 0 : 7);
+        if (!world.load_boxes(layout, std::size(shell) - (layout - shell))) return false;
+        const auto initial = world.status();
+        if (!world.queue_sand_pressure(point, 0.14f, 1000.f)) return false;
+        world.step();
+        if (world.status().packed_sand_blocks != 0) return false;
+        if (!world.queue_sand_pressure(point, 0.14f, 10000000.f) ||
+                world.status().packed_sand_blocks != 0) return false;
+        world.step();
+        const auto after = world.status();
+        if (after.sand_mass != initial.sand_mass || after.packed_sand_blocks != (sealed ? 0 : 1)) return false;
+    }
+    return true;
+}
+
 static bool sustained_compression(somevoxel::World &world) {
     using somevoxel::Vec3;
     using somevoxel::World;
@@ -178,7 +203,10 @@ static bool packed_sand_forms(somevoxel::World &world) {
     world.set_particle_form(center, {1, 0, 0}, World::Sand, 1, 1.4f, 2.f);
     world.step();
     const auto before = world.particle_form_throw();
-    if (before.count != 10 || world.compact(center, 0.14f, 2) != 1) return false;
+    if (before.count != 10 || !world.queue_sand_pressure(center, 0.14f, 10000000.f)) return false;
+    if (world.status().packed_sand_blocks != 0) return false;
+    world.step();
+    if (world.status().packed_sand_blocks != 1) return false;
     const auto packed = world.particle_form_throw();
     if (packed.count != 1 || packed.blocks != 1 || std::abs(packed.mass - before.mass) > 0.0001f) return false;
     if (world.impact(center, 0.14f, 1.f) != 1) return false;
@@ -319,6 +347,11 @@ int main() {
         return 1;
     }
     std::cout << "Only the strong contact compacted sand, preserving its mass\n";
+    if (!pressure_api(world)) {
+        std::cerr << "External pressure changed sand without a simulation step, exposure, or adequate load\n";
+        return 1;
+    }
+    std::cout << "External pressure compacted exposed sand only after a simulation step\n";
     if (!sustained_compression(world)) {
         std::cerr << "Sustained contact failed to distinguish gentle and strong compression\n";
         return 1;

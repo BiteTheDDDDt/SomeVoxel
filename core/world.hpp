@@ -1315,7 +1315,7 @@ private:
                 voxels[i - slice].kind != Sand || voxels[i + slice].kind != Sand)
             return false;
 
-        if (grain.velocity.y <= 0.f && acceleration.y <= 0.f) {
+        if (!attracted && grain.velocity.y <= 0.f && acceleration.y <= 0.f) {
             grain.travel.y = 0.f;
             grain.blocked_faces &= uint8_t(~grain_axis_faces(1));
             if (grain.velocity.y < -0.3f) {
@@ -1325,11 +1325,9 @@ private:
                 grain.velocity.y = 0.f;
             }
             acceleration.y = 0.f;
-            if (!attracted) {
-                const float retention = step_ground_retention(Sand, granular_material(Sand).ground_retention);
-                grain.velocity.x *= retention;
-                grain.velocity.z *= retention;
-            }
+            const float retention = step_ground_retention(Sand, granular_material(Sand).ground_retention);
+            grain.velocity.x *= retention;
+            grain.velocity.z *= retention;
         }
         if (grain.velocity == V3() && acceleration == V3()) return true;
         constexpr int stride[] = {1, slice, nx};
@@ -1351,11 +1349,12 @@ private:
         return true;
     }
 
-    V3 field_drive(const Grain &grain, I3 from, Kind kind, const FormMotion *form, bool &attracted) const {
+    V3 field_drive(const Grain &grain, I3 from, Kind kind, const FormMotion *form, bool &attracted,
+            bool elastic_only = false) const {
         const GranularMaterial material = granular_material(kind);
         const float density_ratio = gravel_density_ratio(grain);
         if (form && form->expires == 0) {
-            const V3 position = particle_center(from, grain.extent) + grain.travel;
+            const V3 position = particle_center(from, grain.extent) + (elastic_only ? V3() : grain.travel);
             const V3 offset = form_destination(*form) - position;
             const bool lash = form->style == WhipForm && whip_is_lashing();
             const float response = form_body_speed(grain, particle_form.strength * particle_form.response_scale) *
@@ -1369,15 +1368,17 @@ private:
                 spring += inward * gather;
             }
             attracted = true;
-            return spring * (110.f * response) - grain.velocity * (12.f * std::sqrt(response * (1.f + gather)));
+            const V3 elastic = spring * (110.f * response);
+            return elastic_only ? elastic : elastic - grain.velocity * (12.f * std::sqrt(response * (1.f + gather)));
         } else if (!form && pulling && material.attraction_range > 0.f) {
-            const V3 offset = field - particle_center(from, grain.extent) - grain.travel;
+            const V3 offset = field - particle_center(from, grain.extent) - (elastic_only ? V3() : grain.travel);
             const float reach = material.attraction_range * cast_radius_scale;
             if (offset.length_squared() < reach * reach) {
                 float response = sand_density / (material.density * density_ratio * (1.f + 0.065f * (grain.extent - 1)));
                 if (kind == Sand || kind == Gravel) response *= free_sand_pull_response(offset.length_squared());
                 attracted = true;
-                return pull_acceleration(offset, grain.velocity, reach, response, free_pull_stiffness, free_pull_damping);
+                return pull_acceleration(offset, elastic_only ? V3() : grain.velocity, reach, response,
+                    free_pull_stiffness, free_pull_damping);
             }
         }
         return {};
@@ -1403,17 +1404,18 @@ private:
         bool attracted = false;
         acceleration += field_drive(grain, from, kind, form, attracted);
         acceleration += wind_drive(grain, from, kind);
-        if (kind != Sand || !form || form->expires != 0)
-            sample_bearing_contact(grain, from, kind, acceleration, fits, attracted && !form && kind == Sand);
-        if (kind == Sand && !form && airborne_earth_ejecta.empty() && step_enclosed_sand(grain, from, acceleration, attracted))
+        if (kind != Sand || !attracted)
+            sample_bearing_contact(grain, from, kind, acceleration, fits);
+        if (kind == Sand && airborne_earth_ejecta.empty() && step_enclosed_sand(grain, from, acceleration, attracted))
             return {from, from};
         I3 slope;
         int support = -1;
-        // Held neighbors can move together downward. Use swept contact
-        // between them and keep the resting contact against the bulk bed.
+        // A driven grain uses swept contact against mobile material in
+        // either direction. Resting grains and fixed supports can settle early.
         if (grain.velocity.y <= 0.f && acceleration.y <= 0.f && !fits(from + down, &support) &&
                 !(liquid && gravel_can_enter_water(grain, support)) &&
-                !(form && attracted && kind == Sand && support >= 0 && voxels[support].formed)) {
+                !(attracted && kind == Sand && support >= 0 &&
+                    (voxels[support].kind == Sand || voxels[support].kind == Gravel))) {
             grain.travel.y = 0.f;
             grain.blocked_faces &= uint8_t(~grain_axis_faces(1));
             if (retains_grain_face(support)) grain.blocked_faces |= grain_face_bit(1, -1);
@@ -2032,114 +2034,94 @@ private:
     }
 
 public:
-    int compact(V3 point, float radius, int extent = 2) {
-        if (!std::isfinite(radius)) return 0;
-        const float available_work = (4.f / 3.f) * 3.14159265f * radius * radius * radius * 3000.f * cast_strength;
-        return compact_with_work(point, radius, extent, {available_work, {}});
+    bool queue_sand_pressure(V3 point, float radius, float pascals, int extent = 2) {
+        if (!point.is_finite() || point.x < 0.f || point.y < 0.f || point.z < 0.f ||
+                point.x >= nx * scale || point.y >= ny * scale || point.z >= nz * scale ||
+                !std::isfinite(radius) || radius <= 0.f || radius > 1.f ||
+                !std::isfinite(pascals) || pascals <= 0.f || (extent != 2 && extent != 4 && extent != 8) ||
+                sand_pressure_pulses.size() >= 8) return false;
+        sand_pressure_pulses.push_back({point, radius, pascals, extent});
+        return true;
     }
 
 private:
-    int compact_with_work(V3 point, float radius, int extent, MaterialLoad load) {
-        if (!point.is_finite() || !std::isfinite(radius) || radius <= 0 || radius > 1 ||
-                (extent != 2 && extent != 4 && extent != 8)) return 0;
-        const V3 reach(radius, radius, radius);
-        const I3 lo = grid(point - reach);
-        const I3 hi = grid(point + reach);
-        const int align = ~(extent - 1);
+    bool pack_loaded_region(I3 p, int extent, MaterialLoad load) {
+        if (!inside(p) || !inside(p + I3(extent - 1, extent - 1, extent - 1))) return false;
+        const int cell = flat(p);
         const I3 corner(extent - 1, extent - 1, extent - 1);
         const int mass_goal = cube_cells(extent) * sand_packing_percent / 100;
-        const float radius_squared = radius * radius;
-        float work_remaining = load.work;
-        std::vector<std::pair<float, int>> candidates;
-        for (int y = std::max(0, lo.y & align); y <= std::min(ny - extent, hi.y); y += extent)
-            for (int z = std::max(0, lo.z & align); z <= std::min(nz - extent, hi.z); z += extent)
-                for (int x = std::max(0, lo.x & align); x <= std::min(nx - extent, hi.x); x += extent) {
-                    const I3 p(x, y, z);
-                    const float distance = particle_center(p, extent).distance_squared_to(point);
-                    if (distance <= radius_squared) candidates.emplace_back(distance, flat(p));
-                }
-        std::sort(candidates.begin(), candidates.end());
-        int made = 0;
         std::vector<int> blocks;
         std::vector<int> donors;
-        for (const auto &candidate : candidates) {
-            const int cell = candidate.second;
-            const I3 p = decode(cell);
-            bool full = true;
-            int pores = 0;
-            int mass_units = 0;
-            int held_cells = 0;
-            V3 held_anchor;
-            std::optional<FormMotion> held_motion;
-            const auto preserve_form = [&](int i, int cells) {
-                if (!voxels[i].formed) return;
-                const FormMotion &motion = form_motion.at(i);
-                if (motion.expires != 0) return;
-                if (!held_motion) held_motion = motion;
-                held_cells += cells;
-                held_anchor += motion.anchor * float(cells);
-            };
-            V3 momentum;
-            blocks.clear();
-            each_cube(cell, extent, [&](int i) {
-                if (!full) return;
-                const Voxel &v = voxels[i];
-                if (extent == 2 && v.kind == Empty && !body_at(i)) {
-                    full = ++pores <= 2;
-                    return;
-                }
-                if (v.kind == Sand) {
-                    ++mass_units;
-                    momentum += grains[v.occupant].velocity;
-                    preserve_form(i, 1);
-                    return;
-                }
-                if (v.kind != Gravel) { full = false; return; }
-                const Grain &g = gravel[v.occupant];
-                const I3 offset = decode(g.position) - p;
-                full = g.extent < extent && offset.x >= 0 && offset.y >= 0 && offset.z >= 0 &&
-                    offset.x + g.extent <= extent && offset.y + g.extent <= extent && offset.z + g.extent <= extent;
-                if (full && i == g.position) {
-                    blocks.push_back(i);
-                    const int units = gravel_mass_units(g);
-                    mass_units += units;
-                    momentum += g.velocity * units;
-                    preserve_form(i, cube_cells(g.extent));
-                }
-            });
-            if (!full || !gather_gravel_shell(p, extent, mass_goal - mass_units, donors, [&](I3 q) {
-                    return kind_at(q) == Sand && center(q).distance_squared_to(point) <= radius_squared;
-                })) continue;
-            // A pressure source must do work against the material's
-            // compaction resistance before the occupancy can change.
-            const float work = sand_compaction_work(extent, int(donors.size()));
-            if (work > work_remaining) continue;
-            work_remaining -= work;
+        bool full = true;
+        int pores = 0;
+        int mass_units = 0;
+        int held_cells = 0;
+        V3 held_anchor;
+        std::optional<FormMotion> held_motion;
+        const auto preserve_form = [&](int i, int cells) {
+            if (!voxels[i].formed) return;
+            const FormMotion &motion = form_motion.at(i);
+            if (motion.expires != 0) return;
+            if (!held_motion) held_motion = motion;
+            held_cells += cells;
+            held_anchor += motion.anchor * float(cells);
+        };
+        V3 momentum;
+        each_cube(cell, extent, [&](int i) {
+            if (!full) return;
+            const Voxel &v = voxels[i];
+            if (extent == 2 && v.kind == Empty && !body_at(i)) {
+                full = ++pores <= 2;
+                return;
+            }
+            if (v.kind == Sand) {
+                ++mass_units;
+                momentum += grains[v.occupant].velocity;
+                preserve_form(i, 1);
+                return;
+            }
+            if (v.kind != Gravel) { full = false; return; }
+            const Grain &g = gravel[v.occupant];
+            const I3 offset = decode(g.position) - p;
+            full = g.extent < extent && offset.x >= 0 && offset.y >= 0 && offset.z >= 0 &&
+                offset.x + g.extent <= extent && offset.y + g.extent <= extent && offset.z + g.extent <= extent;
+            if (full && i == g.position) {
+                blocks.push_back(i);
+                const int units = gravel_mass_units(g);
+                mass_units += units;
+                momentum += g.velocity * units;
+                preserve_form(i, cube_cells(g.extent));
+            }
+        });
+        if (!full || !gather_gravel_shell(p, extent, mass_goal - mass_units, donors,
+                    [&](I3 q) { return kind_at(q) == Sand; })) return false;
+        // A pressure source must do work against the material's
+        // compaction resistance before the occupancy can change.
+        const float work = sand_compaction_work(extent, int(donors.size()));
+        if (work > load.work) return false;
 
-            for (int i : donors) {
-                momentum += grains[voxels[i].occupant].velocity;
-                replace_element_cell(i, Empty);
-            }
-            for (int origin : blocks) erase_gravel(voxels[origin].occupant);
-            mass_units += int(donors.size());
-            const int id = int(gravel.size());
-            gravel.push_back({cell, cell, tick, extent, momentum / mass_units});
-            gravel.back().sand_units = uint16_t(mass_units);
-            mark_gravel_tile(p);
-            each_cube(cell, extent, [&](int i) {
-                if (voxels[i].kind == Sand) erase_sand(voxels[i].occupant);
-                voxels[i] = {Gravel, voxel_stamp, id};
-                set_mobile(i, false);
-            });
-            if (held_motion && held_cells * 2 >= cube_cells(extent)) {
-                held_motion->anchor = held_anchor / float(held_cells);
-                attach_form_motion(cell, *held_motion);
-            }
-            wake_box(p, p + corner, awake);
-            ++made;
+        for (int i : donors) {
+            momentum += grains[voxels[i].occupant].velocity;
+            replace_element_cell(i, Empty);
         }
-        if (made) ++sand_revision;
-        return made;
+        for (int origin : blocks) erase_gravel(voxels[origin].occupant);
+        mass_units += int(donors.size());
+        const int id = int(gravel.size());
+        gravel.push_back({cell, cell, tick, extent, momentum / mass_units});
+        gravel.back().sand_units = uint16_t(mass_units);
+        mark_gravel_tile(p);
+        each_cube(cell, extent, [&](int i) {
+            if (voxels[i].kind == Sand) erase_sand(voxels[i].occupant);
+            voxels[i] = {Gravel, voxel_stamp, id};
+            set_mobile(i, false);
+        });
+        if (held_motion && held_cells * 2 >= cube_cells(extent)) {
+            held_motion->anchor = held_anchor / float(held_cells);
+            attach_form_motion(cell, *held_motion);
+        }
+        wake_box(p, p + corner, awake);
+        ++sand_revision;
+        return true;
     }
 
     MaterialLoad apply_impact_impulse(Grain &grain, Kind kind, V3 point, float radius, float force = 1.f,

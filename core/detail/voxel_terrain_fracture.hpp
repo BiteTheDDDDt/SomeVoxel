@@ -21,15 +21,23 @@ private:
     std::vector<int> terrain_fracture_jobs;
     std::unordered_map<int, LoadHistory> packed_strain;
     std::vector<int> packed_fracture_jobs;
-    std::vector<std::pair<int, float>> compaction_jobs;
+    using PackingKey = uint64_t;
+    struct SandPressurePulse {
+        V3 center;
+        float radius;
+        float pascals;
+        int extent;
+    };
+    std::vector<std::pair<PackingKey, float>> compaction_jobs;
+    std::vector<SandPressurePulse> sand_pressure_pulses;
     struct CompressionHistory {
         float work = 0.f;
         float pressure = 0.f;
         uint32_t last_contact = 0;
         uint32_t retry_after = 0;
     };
-    std::unordered_map<int, CompressionHistory> contact_compression;
-    std::vector<int> sampled_compression_sites;
+    std::unordered_map<PackingKey, CompressionHistory> contact_compression;
+    std::vector<PackingKey> sampled_compression_sites;
     std::array<int, Char + 1> terrain_contact_breaks{};
     std::array<TerrainImpactPeak, Char + 1> terrain_impact_peaks{};
 
@@ -51,6 +59,7 @@ private:
         packed_strain.clear();
         packed_fracture_jobs.clear();
         compaction_jobs.clear();
+        sand_pressure_pulses.clear();
         contact_compression.clear();
         sampled_compression_sites.clear();
         terrain_contact_breaks.fill(0);
@@ -108,15 +117,18 @@ private:
     // compaction work from half of their dissipated normal kinetic energy.
     static constexpr float minimum_sand_compaction_speed = 16.73f;
 
-    void record_compaction_load(I3 contact, MaterialLoad load) {
-        if (load.work < sand_compaction_work(2, 2) || compaction_jobs.size() >= 64) return;
-        const I3 anchor(contact.x & ~1, contact.y & ~1, contact.z & ~1);
-        compaction_jobs.emplace_back(flat(anchor), load.work);
+    static PackingKey packing_key(I3 p, int extent) {
+        const int mask = ~(extent - 1);
+        return (PackingKey(flat({p.x & mask, p.y & mask, p.z & mask})) << 4) | PackingKey(extent);
     }
 
-    void record_contact_pressure(I3 p, float pressure) {
-        const I3 anchor(p.x & ~1, p.y & ~1, p.z & ~1);
-        const int id = flat(anchor);
+    void record_compaction_load(I3 contact, MaterialLoad load) {
+        if (load.work < sand_compaction_work(2, 2) || compaction_jobs.size() >= 64) return;
+        compaction_jobs.emplace_back(packing_key(contact, 2), load.work);
+    }
+
+    void record_contact_pressure(I3 p, float pressure, int extent = 2) {
+        const PackingKey id = packing_key(p, extent);
         auto entry = contact_compression.find(id);
         if (entry == contact_compression.end()) {
             if (contact_compression.size() >= terrain_strain_limit) return;
@@ -130,7 +142,7 @@ private:
     void integrate_contact_pressure() {
         // Visit sites in sweep order. Each contributes its strongest sample
         // once, even when several grains press on the same region.
-        for (int id : sampled_compression_sites) {
+        for (PackingKey id : sampled_compression_sites) {
             auto &history = contact_compression.at(id);
             const float pressure = std::exchange(history.pressure, 0.f);
             accumulate_site_pressure(id, history, pressure);
@@ -138,7 +150,7 @@ private:
         sampled_compression_sites.clear();
     }
 
-    void accumulate_site_pressure(int id, CompressionHistory &history, float pressure) {
+    void accumulate_site_pressure(PackingKey id, CompressionHistory &history, float pressure) {
         const uint32_t sample_gap = tick - history.last_contact;
         // A held grain can be selected once per eight sampling phases.
         constexpr uint32_t sample_tolerance = 8;
@@ -150,10 +162,13 @@ private:
 
         // Work is pressure above yield times the volume that can close this
         // step. Use one sample per packing region and a bounded strain rate.
-        constexpr float closure_volume = 2.f * scale * scale * scale;
+        const int extent = int(id & 15u);
+        const int cells = cube_cells(extent);
+        const int required_donors = cells * sand_packing_percent / 100 - cells;
+        const float closure_volume = 0.25f * cells * scale * scale * scale;
         constexpr float max_closure_rate = 3.f;
-        const float threshold = sand_compaction_work(2, 2);
-        const float porous_threshold = sand_compaction_work(2, 4);
+        const float threshold = sand_compaction_work(extent, required_donors);
+        const float porous_threshold = sand_compaction_work(extent, required_donors + (extent == 2 ? 2 : 0));
         const float duration = (sample_gap <= sample_tolerance && history.work > 0.f ? sample_gap : 1u) * dt;
         history.work = std::min(porous_threshold,
             history.work + (pressure - sand_yield_pressure) * closure_volume * max_closure_rate * duration);
@@ -170,61 +185,53 @@ private:
         return (((from.x ^ (phase >> 1)) | (from.y ^ phase) | (from.z ^ (phase >> 2))) & 1) == 0;
     }
 
-    float sample_converging_sand_pressure(I3 from) const {
-        // Estimate confinement within the loaded core of the field. The
-        // wider attraction range still transports grains into this region.
-        constexpr float depth = 0.18f;
-        constexpr int cells = int(depth / scale + 0.5f);
-        constexpr float mass_per_area = sand_density * depth;
-        const V3 offset_from_focus = center(from) - field;
-        const float span = 0.32f * cast_radius_scale;
-        const float coverage = 1.f - offset_from_focus.length_squared() / (span * span);
-        if (coverage <= 0.f) return 0.f;
-        const float reach = granular_material(Sand).attraction_range * cast_radius_scale;
+    V3 sand_elastic_acceleration(I3 position) const {
+        const int index = flat(position);
+        const Voxel &voxel = voxels[index];
+        const FormMotion *form = voxel.formed ? &form_motion.at(index) : nullptr;
+        bool attracted = false;
+        return field_drive(grains[voxel.occupant], position, Sand, form, attracted, true);
+    }
+
+    void sample_field_bearing_contact(I3 from, float coverage) {
+        constexpr float bearing_depth = 0.18f;
+        constexpr int bearing_cells = int(bearing_depth / scale + 0.5f);
+        const V3 local = sand_elastic_acceleration(from);
         float best = sand_yield_pressure;
         for (int axis = 0; axis < 3; ++axis) {
-            if (std::abs(offset_from_focus[axis]) >= depth) continue;
             float opposing[2]{};
+            bool supported[2]{};
             for (int side = 0; side < 2; ++side) {
                 const int direction = 2 * side - 1;
-                I3 offset;
-                offset[axis] = direction;
+                I3 normal;
+                normal[axis] = direction;
                 I3 endpoint = from;
-                for (int step = 0; step < cells; ++step) {
-                    if (kind_at(endpoint + offset) != Sand) break;
-                    endpoint += offset;
+                for (int step = 0; step < bearing_cells; ++step) {
+                    const I3 next = endpoint + normal;
+                    if (!inside(next)) break;
+                    const int index = flat(next);
+                    if (voxels[index].kind != Sand) {
+                        supported[side] = retains_grain_face(index);
+                        break;
+                    }
+                    endpoint = next;
                 }
-                if (endpoint == from) break;
-                const V3 displacement = field - center(endpoint);
-                if (displacement[axis] * direction >= 0.f) break;
-                const float response = free_sand_pull_response(displacement.length_squared());
-                // Damping dissipates motion. Estimate sustained pressure
-                // from the elastic load carried by the connected grains.
-                opposing[side] = -direction *
-                    pull_acceleration(displacement, {}, reach, response, free_pull_stiffness, free_pull_damping)[axis];
+                if (endpoint != from)
+                    opposing[side] = std::max(0.f, -direction * sand_elastic_acceleration(endpoint)[axis]);
+                if (supported[side])
+                    best = std::max(best, sand_density * bearing_depth * coverage *
+                        (direction * local[axis] + (axis == 1 ? -direction * gravity : 0.f)));
             }
-            const float pressure = mass_per_area * coverage * std::min(opposing[0], opposing[1]);
+            const float pressure = sand_density * bearing_depth * coverage * std::min(opposing[0], opposing[1]);
             best = std::max(best, pressure);
         }
-        return best;
+        if (best > sand_yield_pressure) record_contact_pressure(from, best);
     }
 
     template <typename Fits>
-    void sample_bearing_contact(const Grain &grain, I3 from, Kind kind, V3 acceleration, const Fits &fits,
-            bool freely_pulled = false) {
+    void sample_bearing_contact(const Grain &grain, I3 from, Kind kind, V3 acceleration, const Fits &fits) {
         if (kind != Sand && kind != Gravel && kind != Rock) return;
-        if (kind == Sand) {
-            if (voxels[grain.position].formed) {
-                if (!sample_sand_pressure_at(from)) return;
-            } else {
-                const int corner = int(tick & 1u);
-                if (((from.x ^ corner) | (from.y ^ corner) | (from.z ^ corner)) & 1) return;
-            }
-        }
-        if (freely_pulled && kind == Sand) {
-            const float pressure = sample_converging_sand_pressure(from);
-            if (pressure > sand_yield_pressure) record_contact_pressure(from, pressure);
-        }
+        if (kind == Sand && !sample_sand_pressure_at(from)) return;
         // One physical bearing layer approximates the load carried by
         // neighboring grains. A rigid packet uses its mass and face area.
         const float edge = scale * grain.extent;
@@ -249,7 +256,6 @@ private:
                 if (fits(neighbor, &obstacle) || obstacle < 0) continue;
                 const Kind surface = voxels[obstacle].kind;
                 const bool fixed = kind == Sand && retains_grain_face(obstacle);
-                if (freely_pulled && !fixed) continue;
                 if (surface != Sand && !(kind == Sand && (surface == Gravel || fixed))) continue;
                 const float pressure = (fixed || kind != Sand ? applied : relative) * direction;
                 if (pressure > best) {
@@ -274,19 +280,6 @@ private:
             if (kind_at(inner + normal) != Sand) break;
             inner += normal;
         }
-        // Grains travelling together do not load one another with the
-        // acceleration they share along the bearing path.
-        if (kind == Sand && voxels[grain.position].formed && voxels[flat(inner)].formed &&
-                inside(inner + normal) && !retains_grain_face(flat(inner + normal))) {
-            const int endpoint = flat(inner);
-            const Grain &receiver = grains[voxels[endpoint].occupant];
-            bool receiver_driven = false;
-            const V3 receiver_acceleration = field_drive(receiver, inner, Sand, &form_motion.at(endpoint), receiver_driven)
-                + wind_drive(receiver, inner, Sand);
-            if (receiver_driven)
-                best -= mass_per_area * std::max(0.f, receiver_acceleration.dot(V3(normal)));
-        }
-        if (best <= sand_yield_pressure) return;
         // The bearing face loads the loose sand on both sides.
         if (kind == Sand) record_contact_pressure(from, best);
         record_contact_pressure(contact, best);
@@ -294,22 +287,94 @@ private:
         if (inner != contact && transmitted > sand_yield_pressure) record_contact_pressure(inner, transmitted);
     }
 
-    void sample_held_sand_pressure() {
+    void sample_sand_field_pressure() {
+        // The same physical neighborhood and sampling phase apply to
+        // every elastic force source. Dispatch only locates driven cells.
+        const float span = 0.32f * cast_radius_scale;
+        const float inverse_span_squared = 1.f / (span * span);
+        const auto sample = [&](I3 p, V3 focus) {
+            const float coverage = 1.f - center(p).distance_squared_to(focus) * inverse_span_squared;
+            if (coverage > 0.f) sample_field_bearing_contact(p, coverage);
+        };
+        if (pulling) {
+            const V3 reach(span, span, span);
+            const I3 lo = grid(field - reach);
+            const I3 hi = grid(field + reach);
+            const int phase = int(tick & 7u);
+            const auto first = [](int start, int parity) { return start + ((start ^ parity) & 1); };
+            for (int y = first(std::max(0, lo.y), phase); y <= std::min(ny - 1, hi.y); y += 2)
+                for (int z = first(std::max(0, lo.z), phase >> 2); z <= std::min(nz - 1, hi.z); z += 2)
+                    for (int x = first(std::max(0, lo.x), phase >> 1); x <= std::min(nx - 1, hi.x); x += 2) {
+                        const I3 p(x, y, z);
+                        const Voxel &voxel = voxels[flat(p)];
+                        if (voxel.kind != Sand || voxel.formed) continue;
+                        sample(p, field);
+                    }
+        }
         if (particle_form.material != Sand) return;
-        // Probe both ends of each contact against the same world state.
-        // The motion sweep updates occupied cells and velocities bottom-up.
+        std::vector<int> held_samples;
         for (const auto &[index, motion] : form_motion) {
             if (motion.expires != 0 || voxels[index].kind != Sand) continue;
-            const I3 from = decode(index);
-            if (!sample_sand_pressure_at(from)) continue;
-            const Grain &grain = grains[voxels[index].occupant];
-            bool attracted = false;
-            const V3 acceleration = V3(0, -gravity, 0) + field_drive(grain, from, Sand, &motion, attracted)
-                + wind_drive(grain, from, Sand);
-            sample_bearing_contact(grain, from, Sand, acceleration, [&](I3 p, int *contact) {
-                return can_enter(p, Sand, contact);
-            });
+            if (sample_sand_pressure_at(decode(index))) held_samples.push_back(index);
         }
+        std::sort(held_samples.begin(), held_samples.end());
+        for (int index : held_samples) sample(decode(index), particle_form.point);
+    }
+
+    float pressure_face_coverage(I3 origin, int extent, int axis) const {
+        const int u = (axis + 1) % 3;
+        const int v = (axis + 2) % 3;
+        int loaded = 0;
+        for (int a = 0; a < extent; ++a)
+            for (int b = 0; b < extent; ++b) {
+                I3 lo = origin;
+                lo[u] += a;
+                lo[v] += b;
+                I3 hi = lo;
+                hi[axis] += extent - 1;
+                const auto granular = [&](I3 p) {
+                    const Kind kind = kind_at(p);
+                    return kind == Sand || kind == Gravel;
+                };
+                if (!granular(lo) || !granular(hi)) continue;
+                --lo[axis];
+                ++hi[axis];
+                // The external press can reach at least one exposed face.
+                // The opposite face carries the reaction.
+                if (kind_at(lo) == Empty || kind_at(hi) == Empty) ++loaded;
+            }
+        return float(loaded) / (extent * extent);
+    }
+
+    void sample_sand_pressure_pulses() {
+        for (const SandPressurePulse &pulse : sand_pressure_pulses) {
+            const float radius_squared = pulse.radius * pulse.radius;
+            const V3 reach(pulse.radius, pulse.radius, pulse.radius);
+            const int extent = pulse.extent;
+            const int mask = ~(extent - 1);
+            const I3 lo = grid(pulse.center - reach);
+            const I3 hi = grid(pulse.center + reach);
+            std::vector<std::pair<float, int>> contacts;
+            for (int y = std::max(0, lo.y & mask); y <= std::min(ny - extent, hi.y); y += extent)
+                for (int z = std::max(0, lo.z & mask); z <= std::min(nz - extent, hi.z); z += extent)
+                    for (int x = std::max(0, lo.x & mask); x <= std::min(nx - extent, hi.x); x += extent) {
+                        const I3 p(x, y, z);
+                        const float distance = particle_center(p, extent).distance_squared_to(pulse.center);
+                        if (distance < radius_squared) contacts.emplace_back(distance, flat(p));
+                    }
+            constexpr size_t max_samples = 96;
+            const size_t count = std::min(max_samples, contacts.size());
+            std::partial_sort(contacts.begin(), contacts.begin() + count, contacts.end());
+            for (size_t i = 0; i < count; ++i) {
+                const auto [distance, index] = contacts[i];
+                const I3 p = decode(index);
+                const float coverage = std::max({pressure_face_coverage(p, extent, 0),
+                    pressure_face_coverage(p, extent, 1), pressure_face_coverage(p, extent, 2)});
+                const float pressure = pulse.pascals * coverage * (1.f - distance / radius_squared);
+                if (pressure > sand_yield_pressure) record_contact_pressure(p, pressure, extent);
+            }
+        }
+        sand_pressure_pulses.clear();
     }
 
     void finish_contact_compaction() {
@@ -327,8 +392,9 @@ private:
             const auto [anchor, initial_work] = compaction_jobs[i++];
             float work = initial_work;
             while (i < compaction_jobs.size() && compaction_jobs[i].first == anchor) work += compaction_jobs[i++].second;
-            const I3 site = decode(anchor);
-            if (compact_with_work(particle_center(site, 2), std::min(1.f, 1.7f * scale), 2, {work, {}}))
+            const int extent = int(anchor & 15u);
+            const I3 site = decode(int(anchor >> 4));
+            if (pack_loaded_region(site, extent, {work, {}}))
                 contact_compression.erase(anchor);
         }
         compaction_jobs.clear();

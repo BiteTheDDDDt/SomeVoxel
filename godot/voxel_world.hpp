@@ -70,7 +70,8 @@ protected:
             &VoxelWorld::start_earth_wave);
         ClassDB::bind_method(D_METHOD("earth_wave_state"), &VoxelWorld::earth_wave_state);
         ClassDB::bind_method(D_METHOD("take_earth_contacts"), &VoxelWorld::take_earth_contacts);
-        ClassDB::bind_method(D_METHOD("compact", "point", "radius", "extent"), &VoxelWorld::compact, DEFVAL(2));
+        ClassDB::bind_method(D_METHOD("queue_sand_pressure", "point", "radius", "pascals", "extent"),
+            &VoxelWorld::queue_sand_pressure, DEFVAL(2));
         ClassDB::bind_method(D_METHOD("impact", "point", "radius", "strength", "pressure_source"),
             &VoxelWorld::impact, DEFVAL(1.f), DEFVAL(V3(std::numeric_limits<float>::infinity(), 0, 0)));
         ClassDB::bind_method(D_METHOD("grain_count"), &VoxelWorld::grain_count);
@@ -363,8 +364,8 @@ public:
         return contact_map(world.take_earth_contacts());
     }
 
-    int compact(V3 point, float radius, int extent) {
-        return world.compact(somevoxel::from_godot(point), radius, extent);
+    bool queue_sand_pressure(V3 point, float radius, float pascals, int extent) {
+        return world.queue_sand_pressure(somevoxel::from_godot(point), radius, pascals, extent);
     }
 
     int impact(V3 point, float radius, float strength, V3 pressure_source) {
