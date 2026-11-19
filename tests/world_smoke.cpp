@@ -145,6 +145,47 @@ static bool sustained_compression(somevoxel::World &world) {
     return true;
 }
 
+static bool packed_sand_forms(somevoxel::World &world) {
+    using somevoxel::Vec3;
+    using somevoxel::World;
+    const int32_t floor[] = {0, 0, 0, 120, 4, 120, World::Stone};
+    for (int extent : {2, 4, 8}) {
+        if (!world.load_boxes(floor, std::size(floor))) return false;
+        const Vec3 source(3.f, 1.5f, 3.f);
+        const auto handle = world.spawn_packed_particle(source, extent);
+        if (!handle) return false;
+        const auto initial = world.packed_particle_state(handle);
+        world.set_particle_form(source, {1, 0, 0}, World::Sand, 1, 2.4f, 4.f);
+        world.step();
+        if (world.particle_form_count() != 1) return false;
+        world.set_particle_form(source + Vec3(0, 0.65f, 0), {1, 0, 0}, World::Sand, 1, 2.4f, 4.f);
+        for (int tick = 0; tick < 42; ++tick) world.step();
+        const auto held = world.packed_particle_state(handle);
+        const auto preview = world.particle_form_throw(1.f, 1.f);
+        if (!held || held->position.y < initial->position.y + 0.09f || preview.blocks != 1 || preview.count != 1 ||
+                std::abs(preview.mass - World::packed_particle_mass(extent)) > 0.0001f) return false;
+        if (world.launch_particle_form({1, 0, 0}, 1.f, 1.f) != 1 ||
+                world.packed_particle_state(handle)->velocity.x <= held->velocity.x) return false;
+    }
+
+    const int32_t pile[] = {
+        0, 0, 0, 120, 4, 120, World::Stone,
+        60, 4, 60, 62, 6, 62, World::Sand,
+        62, 4, 60, 63, 6, 61, World::Sand,
+    };
+    if (!world.load_boxes(pile, std::size(pile))) return false;
+    const Vec3 center = Vec3(61, 5, 61) * world.status().cell_size;
+    world.set_particle_form(center, {1, 0, 0}, World::Sand, 1, 1.4f, 2.f);
+    world.step();
+    const auto before = world.particle_form_throw();
+    if (before.count != 10 || world.compact(center, 0.14f, 2) != 1) return false;
+    const auto packed = world.particle_form_throw();
+    if (packed.count != 1 || packed.blocks != 1 || std::abs(packed.mass - before.mass) > 0.0001f) return false;
+    if (world.impact(center, 0.14f, 1.f) != 1) return false;
+    const auto loose = world.particle_form_throw();
+    return loose.count == 10 && loose.blocks == 0 && std::abs(loose.mass - before.mass) <= 0.0001f;
+}
+
 int main() {
     if (!water_head_selection()) {
         std::cerr << "Water head backend selection or GPU failure recovery failed\n";
@@ -225,4 +266,9 @@ int main() {
         return 1;
     }
     std::cout << "Sustained bearing loads compacted held sand without changing its mass\n";
+    if (!packed_sand_forms(world)) {
+        std::cerr << "Mixed-size forms lost control, mass or release momentum\n";
+        return 1;
+    }
+    std::cout << "Forms lifted and launched every packed size and retained control across packing and fracture\n";
 }

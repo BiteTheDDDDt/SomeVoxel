@@ -175,6 +175,30 @@ private:
         }
     }
 
+    const Grain &form_grain(int i) const {
+        const Voxel &voxel = voxels[i];
+        if (voxel.kind == Water) return liquid_particle(i);
+        return voxel.kind == Gravel ? gravel[voxel.occupant] : grains[voxel.occupant];
+    }
+
+    Grain &form_grain(int i) {
+        return *movable_particle_at(i);
+    }
+
+    void attach_form_motion(int i, FormMotion motion) {
+        if (form_motion.size() >= form_motion_limit) return;
+        if (!form_motion.emplace(i, motion).second) return;
+        set_form_voxel(i, true);
+        if (motion.expires == 0) ++held_form_count;
+    }
+
+    int held_form_cells() const {
+        int cells = 0;
+        for (const auto &item : form_motion)
+            if (item.second.expires == 0) cells += cube_cells(form_grain(item.first).extent);
+        return cells;
+    }
+
     void release_held_form() {
         if (particle_form.style == NoForm) return;
         for (auto item = form_motion.begin(); item != form_motion.end();) {
@@ -193,7 +217,8 @@ private:
     }
 
     void recruit_form_particles() {
-        const int limit = std::min({form_capacity() - held_form_count, int(form_motion_limit - form_motion.size()), 120});
+        int available_cells = form_capacity() - held_form_cells();
+        const int limit = std::min({available_cells, int(form_motion_limit - form_motion.size()), 120});
         if (limit <= 0) return;
 
         form_candidates.clear();
@@ -201,48 +226,59 @@ private:
         const bool whip = particle_form.style == WhipForm;
         const V3 line = particle_form.point - particle_form.handle;
         const float inverse_length = whip ? 1.f / std::max(0.000001f, line.length_squared()) : 0.f;
-        const auto consider = [&](int i) {
-            if (voxels[i].formed) return;
-            const V3 sample = center(decode(i));
+        const auto consider = [&](int i, int extent) {
+            if (voxels[i].formed || cube_cells(extent) > available_cells) return;
+            const V3 sample = particle_center(decode(i), extent);
             const float nearest = whip ? std::clamp((sample - particle_form.handle).dot(line) * inverse_length, 0.f, 1.f) : 1.f;
             const float distance = sample.distance_squared_to(particle_form.handle + line * nearest);
             if (distance > reach_squared) return;
             form_candidates.emplace_back(distance, i);
         };
         if (particle_form.material == Water) {
-            for (int i : water_positions) consider(i);
+            for (int i : water_positions) consider(i, 1);
         } else {
-            for (const Grain &grain : grains) consider(grain.position);
+            for (const Grain &grain : grains) consider(grain.position, 1);
+            for (const Grain &grain : gravel) consider(grain.position, grain.extent);
         }
         if (int(form_candidates.size()) > limit) {
             std::nth_element(form_candidates.begin(), form_candidates.begin() + limit, form_candidates.end());
             form_candidates.resize(limit);
         }
+        if (particle_form.material == Sand && !gravel.empty())
+            std::sort(form_candidates.begin(), form_candidates.end());
         for (const auto &candidate : form_candidates) {
             const int i = candidate.second;
+            const int cells = voxels[i].kind == Gravel ? cube_cells(gravel[voxels[i].occupant].extent) : 1;
+            if (cells > available_cells) continue;
             FormMotion motion;
             motion.anchor = form_anchor(uint32_t(i) + tick * 0x9e3779b9u, particle_form.style);
             motion.style = particle_form.style;
             if (particle_form.material == Water) ensure_liquid_motion(i);
-            form_motion.emplace(i, motion);
-            set_form_voxel(i, true);
-            ++held_form_count;
+            attach_form_motion(i, motion);
+            available_cells -= cells;
         }
     }
 
     void trim_held_form() {
         const int capacity = form_capacity();
-        if (held_form_count <= capacity) return;
+        if (held_form_cells() <= capacity) return;
         form_candidates.clear();
         for (const auto &entry : form_motion) {
             if (entry.second.expires == 0) {
-                const float distance = center(decode(entry.first)).distance_squared_to(particle_form.point);
+                const auto &grain = form_grain(entry.first);
+                const float distance = particle_center(decode(entry.first), grain.extent).distance_squared_to(particle_form.point);
                 form_candidates.emplace_back(distance, entry.first);
             }
         }
-        std::nth_element(form_candidates.begin(), form_candidates.begin() + capacity, form_candidates.end());
-        for (size_t n = capacity; n < form_candidates.size(); ++n) {
-            const int i = form_candidates[n].second;
+        std::sort(form_candidates.begin(), form_candidates.end());
+        int retained_cells = 0;
+        for (const auto &candidate : form_candidates) {
+            const int i = candidate.second;
+            const int cells = cube_cells(form_grain(i).extent);
+            if (retained_cells + cells <= capacity) {
+                retained_cells += cells;
+                continue;
+            }
             forget_particle_form(i);
             wake_near(decode(i), awake);
         }
@@ -265,12 +301,13 @@ private:
         }
     }
 
-    bool contact_form_target(FormMotion &motion, Kind material, I3 from, I3 to, V3 velocity, int axis) {
+    bool contact_form_target(FormMotion &motion, Kind material, const Grain &grain, I3 from, I3 to, V3 velocity, int axis) {
         const bool launched = motion.expires != 0;
         const bool whip = motion.style == WhipForm;
         if (form_targets.empty() || (!launched && motion.style != BladeForm && !whip)) return false;
-        const V3 a = center(from), b = center(to);
-        const V3 padding = V3(0.48f, 0.48f, 0.48f) * scale;
+        const V3 a = particle_center(from, grain.extent), b = particle_center(to, grain.extent);
+        const float radius = 0.48f * scale * grain.extent;
+        const V3 padding(radius, radius, radius);
         const int other_a = (axis + 1) % 3, other_b = (axis + 2) % 3;
         FormTarget *hit_target = nullptr;
         float nearest = std::numeric_limits<float>::infinity();
@@ -300,7 +337,7 @@ private:
             const float slice = std::abs(velocity.normalized().dot(facing));
             const float profile = motion.style == BladeForm ? 0.72f + 1.18f * slice : whip ? 0.5f + 0.65f * motion.anchor.x : 1.f;
             const float response = launched ? 0.055f : lashing ? 0.14f : 0.18f;
-            hit_target->pending_damage += response * particle_mass(material, 1) * speed * speed * profile;
+            hit_target->pending_damage += response * particle_mass(material, grain) * speed * speed * profile;
             motion.last_contact = tick + uint32_t(simulation_hz / 30 * 5);
         }
         return true;
@@ -338,6 +375,7 @@ private:
         double impulse = 0.0;
         float fastest = 0.f;
         int count = 0;
+        int blocks = 0;
 
         void add(Kind kind, const Grain &grain, float speed = 0.f) {
             const double weight = particle_mass(kind, grain);
@@ -353,6 +391,7 @@ private:
             impulse += weight * speed;
             fastest = std::max(fastest, speed);
             ++count;
+            blocks += kind == Gravel;
         }
 
         float speed() const { return mass > 0.0 ? float(impulse / mass) : 0.f; }
@@ -362,7 +401,7 @@ private:
             const auto mean = [this](const std::array<double, 3> &sum) {
                 return V3(float(sum[0] / mass), float(sum[1] / mass), float(sum[2] / mass));
             };
-            return {mean(position_sum), mean(momentum), speed, float(mass), count};
+            return {mean(position_sum), mean(momentum), speed, float(mass), count, blocks};
         }
     };
 
@@ -427,20 +466,26 @@ private:
 
     bool form_launchable(int index, const FormMotion &motion, V3 margin) const {
         if (motion.expires != 0) return false;
-        const V3 offset = center(decode(index)) - particle_form.point;
+        const Grain &grain = form_grain(index);
+        const V3 offset = particle_center(decode(index), grain.extent) - particle_form.point;
+        const float pad = (grain.extent - 1) * scale * 0.5f;
+        margin += V3(pad, pad, pad);
         return std::abs(offset.dot(particle_form.right)) <= margin.x &&
             std::abs(offset.dot(particle_form.up)) <= margin.y &&
             std::abs(offset.dot(particle_form.forward)) <= margin.z;
     }
 
-    ThrowSample sample_particle_form(V3 margin) const {
+    static float form_body_speed(const Grain &grain, float base_speed) {
+        return base_speed / ((1.f + 0.065f * (grain.extent - 1)) * gravel_density_ratio(grain));
+    }
+
+    ThrowSample sample_particle_form(V3 margin, float base_speed) const {
         ThrowSample sample;
-        const Kind kind = particle_form.material;
         for (const auto &entry : form_motion) {
             const int i = entry.first;
             if (!form_launchable(i, entry.second, margin)) continue;
-            const Grain &grain = kind == Water ? liquid_particle(i) : grains[voxels[i].occupant];
-            sample.add(kind, grain);
+            const Grain &grain = form_grain(i);
+            sample.add(voxels[i].kind, grain, form_body_speed(grain, base_speed));
         }
         return sample;
     }
@@ -476,9 +521,7 @@ public:
         const float fine_speed = loose_sand_speed(impulse_scale);
         const ThrowSample sample = sample_free_sand(candidates, impulse_scale, fine_speed);
         const float speed = sample.speed();
-        ThrowInfo result = sample.result(speed + charge_speed_increment(sample.mass, speed, sample.fastest, charge));
-        result.blocks = int(candidates.blocks.size());
-        return result;
+        return sample.result(speed + charge_speed_increment(sample.mass, speed, sample.fastest, charge));
     }
 
     int launch_free_sand(V3 point, V3 direction, float impulse_scale = 1.f, float charge = 0.f) {
@@ -561,9 +604,9 @@ public:
         if (held_form_count == 0 || particle_form.style == WhipForm || !std::isfinite(impulse_scale) || !std::isfinite(charge))
             return {};
         const V3 margin = particle_form.half + V3(0.11f, 0.11f, 0.11f);
-        const ThrowSample sample = sample_particle_form(margin);
-        const float speed = particle_form_speed(impulse_scale);
-        return sample.result(speed + charge_speed_increment(sample.mass, speed, speed, charge));
+        const ThrowSample sample = sample_particle_form(margin, particle_form_speed(impulse_scale));
+        const float speed = sample.speed();
+        return sample.result(speed + charge_speed_increment(sample.mass, speed, sample.fastest, charge));
     }
 
     int launch_particle_form(V3 direction, float impulse_scale = 1.f, float charge = 0.f) {
@@ -583,19 +626,19 @@ public:
             return held_form_count;
         }
         const V3 launch_margin = particle_form.half + V3(0.11f, 0.11f, 0.11f);
-        float speed = particle_form_speed(impulse_scale);
+        const float speed = particle_form_speed(impulse_scale);
+        float boost = 0.f;
         if (charge > 0.f) {
-            const ThrowSample sample = sample_particle_form(launch_margin);
-            speed += charge_speed_increment(sample.mass, speed, speed, charge);
+            const ThrowSample sample = sample_particle_form(launch_margin, speed);
+            boost = charge_speed_increment(sample.mass, sample.speed(), sample.fastest, charge);
         }
-        const V3 impulse = direction * (speed * particle_mass(particle_form.material, 1));
         int launched = 0;
         for (auto &entry : form_motion) {
             FormMotion &motion = entry.second;
             const int i = entry.first;
             if (!form_launchable(i, motion, launch_margin)) continue;
-            Grain &grain = particle_form.material == Water ? liquid_particle(i) : grains[voxels[i].occupant];
-            grain.velocity += impulse / particle_mass(particle_form.material, grain);
+            Grain &grain = form_grain(i);
+            grain.velocity += direction * (form_body_speed(grain, speed) + boost);
             motion.forward = direction;
             motion.expires = tick + uint32_t(simulation_hz / 30 * 24);
             ++launched;

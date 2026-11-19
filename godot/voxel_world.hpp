@@ -22,6 +22,7 @@ class VoxelWorld : public godot::RefCounted {
         result["speed"] = state.speed;
         result["mass"] = state.mass;
         result["count"] = state.count;
+        result["blocks"] = state.blocks;
         return result;
     }
 
@@ -275,10 +276,7 @@ public:
     }
 
     godot::Dictionary free_sand_throw(V3 point, float impulse_scale, float charge) const {
-        const auto state = world.free_sand_throw(somevoxel::from_godot(point), impulse_scale, charge);
-        auto result = throw_summary(state);
-        if (state.count != 0) result["blocks"] = state.blocks;
-        return result;
+        return throw_summary(world.free_sand_throw(somevoxel::from_godot(point), impulse_scale, charge));
     }
 
     void step() {

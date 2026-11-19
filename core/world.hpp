@@ -906,6 +906,7 @@ private:
     }
 
     void erase_gravel(int id) {
+        forget_particle_form(gravel[id].position);
         if (!sand_tile_dirty.empty()) mark_gravel_tile(decode(gravel[id].position));
         if (!airborne_earth_ejecta.empty()) airborne_earth_ejecta.erase(gravel[id].position);
         const int last = int(gravel.size()) - 1;
@@ -973,6 +974,8 @@ private:
     void move_gravel(int id, I3 target, std::array<bool, chunk_count> &wake,
             const GravelLiquidMove *liquid = nullptr) {
         Grain &grain = gravel[id];
+        const int origin = grain.position;
+        auto form = voxels[origin].formed ? form_motion.extract(origin) : decltype(form_motion)::node_type{};
         const I3 from = decode(grain.position);
         const int destination = flat(target);
         move_earth_ejecta(grain.position, destination);
@@ -980,6 +983,11 @@ private:
         each_cube(grain.position, grain.extent, [&](int i) { voxels[i] = {}; });
         if (liquid) commit_gravel_liquid_move(grain, *liquid);
         each_cube(destination, grain.extent, [&](int i) { voxels[i] = {Gravel, voxel_stamp, id}; });
+        if (form) {
+            form.key() = destination;
+            form_motion.insert(std::move(form));
+            voxels[destination].formed = true;
+        }
         record_grain_move(grain, destination, moved_gravel);
         mark_gravel_tile(from);
         mark_gravel_tile(target);
@@ -1267,7 +1275,7 @@ private:
                 // step still contributes, including pushes from other grains.
                 const float kinetic_velocity = resting_face ? previous_velocity[axis] : grain.velocity[axis];
                 resolve_granular_contact(grain, kind, axis, direction[axis], obstacle, kinetic_velocity, false, next);
-            } else if ((form && contact_form_target(*form, kind, position, next, grain.velocity, axis)) ||
+            } else if ((form && contact_form_target(*form, kind, grain, position, next, grain.velocity, axis)) ||
                     (earth_peaks && axis == 1 && direction[axis] > 0 &&
                         record_earth_contact(grain, position, next, *earth_peaks))) {
                 grain.velocity[axis] = 0.f;
@@ -1356,7 +1364,7 @@ private:
             const V3 position = particle_center(from, grain.extent) + grain.travel;
             const V3 offset = form_destination(*form) - position;
             const bool lash = form->style == WhipForm && whip_is_lashing();
-            const float response = particle_form.strength * (lash ? 2.2f : 1.f);
+            const float response = form_body_speed(grain, particle_form.strength) * (lash ? 2.2f : 1.f);
             const float gather = 1.7f * form_charge_gather();
             V3 spring = offset;
             if (gather > 0.f) {
@@ -1440,9 +1448,10 @@ private:
             Grain &grain = gravel[id];
             const I3 from = decode(grain.position);
             if (!gravel_awake(from, grain.extent)) continue;
+            FormMotion *form = voxels[grain.position].formed ? &form_motion.at(grain.position) : nullptr;
             const ParticlePath path = advance_particle(grain, from, Gravel, [&](I3 candidate, int *contact = nullptr) {
                 return fits_gravel(candidate, id, contact);
-            }, nullptr, V3(), &liquid);
+            }, form, V3(), &liquid);
             if (path.target == from) continue;
             if (path.gravel_water_exchange && path.exchange_from != from)
                 move_gravel(id, path.exchange_from, next_awake);
@@ -1692,16 +1701,17 @@ public:
         while (inside(cell) && enter <= leave) {
             const Voxel &voxel = voxels[flat(cell)];
             const Kind material = voxel.kind;
-            bool held_sand = false;
-            if (ignore_formed && pulling && (material == Sand || material == Gravel)) {
+            bool held_sand = ignore_formed && voxel.formed;
+            if (ignore_formed && (material == Gravel || (material == Sand && pulling))) {
                 const Grain &grain = material == Sand ? grains[voxel.occupant] : gravel[voxel.occupant];
                 // The aim ray can see through the cluster around the held
                 // charge. The projectile still collides with those grains.
-                held_sand = free_sand_focus_distance_squared(field, particle_center(decode(grain.position), grain.extent)) <
-                    held_reach * held_reach;
+                held_sand = voxels[grain.position].formed || (pulling &&
+                    free_sand_focus_distance_squared(field, particle_center(decode(grain.position), grain.extent)) <
+                        held_reach * held_reach);
             }
             if (material != Empty && material != Steam && (include_water || material != Water) &&
-                    (!ignore_formed || (!voxel.formed && !held_sand)))
+                    !held_sand)
                 return origin + direction * std::min(leave, enter + epsilon);
             enter = std::min({crossing.x, crossing.y, crossing.z});
             for (int axis = 0; axis < 3; ++axis) {
@@ -2037,6 +2047,17 @@ private:
             const I3 p = decode(cell);
             bool full = true;
             int mass_units = 0;
+            int held_cells = 0;
+            V3 held_anchor;
+            std::optional<FormMotion> held_motion;
+            const auto preserve_form = [&](int i, int cells) {
+                if (!voxels[i].formed) return;
+                const FormMotion &motion = form_motion.at(i);
+                if (motion.expires != 0) return;
+                if (!held_motion) held_motion = motion;
+                held_cells += cells;
+                held_anchor += motion.anchor * float(cells);
+            };
             V3 momentum;
             blocks.clear();
             each_cube(cell, extent, [&](int i) {
@@ -2045,6 +2066,7 @@ private:
                 if (v.kind == Sand) {
                     ++mass_units;
                     momentum += grains[v.occupant].velocity;
+                    preserve_form(i, 1);
                     return;
                 }
                 if (v.kind != Gravel) { full = false; return; }
@@ -2057,6 +2079,7 @@ private:
                     const int units = gravel_mass_units(g);
                     mass_units += units;
                     momentum += g.velocity * units;
+                    preserve_form(i, cube_cells(g.extent));
                 }
             });
             if (!full || !gather_gravel_shell(p, extent, mass_goal - mass_units, donors, [&](I3 q) {
@@ -2083,6 +2106,10 @@ private:
                 voxels[i] = {Gravel, voxel_stamp, id};
                 set_mobile(i, false);
             });
+            if (held_motion && held_cells * 2 >= cube_cells(extent)) {
+                held_motion->anchor = held_anchor / float(held_cells);
+                attach_form_motion(cell, *held_motion);
+            }
             wake_box(p, p + corner, awake);
             ++made;
         }

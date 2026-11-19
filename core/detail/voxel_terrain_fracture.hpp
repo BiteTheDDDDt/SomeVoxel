@@ -271,6 +271,7 @@ private:
         if (extent == 2 && !gather_gravel_shell(start, extent, mass_units - cube_cells(extent), overflow,
                 [&](I3 p) { return voxels[flat(p)].kind == Empty && !body_at(flat(p)); })) return false;
 
+        const auto motion = voxels[origin].formed ? std::optional<FormMotion>(form_motion.at(origin)) : std::nullopt;
         erase_gravel(id);
         if (extent == 2) {
             invalidate_support_above(start, extent);
@@ -280,6 +281,7 @@ private:
                 if (!sand_tile_dirty.empty()) mark_sand_tiles(decode(i));
                 queue_sand_contact(i);
                 set_mobile(i, true);
+                if (motion) attach_form_motion(i, *motion);
                 wake_near(decode(i), awake);
             };
             each_cube(origin, extent, release);
@@ -293,6 +295,7 @@ private:
                 if (grain.sand_units) gravel.back().sand_units = uint16_t(mass_units / 8);
                 if (!sand_tile_dirty.empty()) mark_gravel_tile(decode(child));
                 each_cube(child, half, [&](int i) { voxels[i] = {Gravel, voxel_stamp, child_id}; });
+                if (motion) attach_form_motion(child, *motion);
             }
         }
         wake_box(start, start + I3(extent - 1, extent - 1, extent - 1), awake);
