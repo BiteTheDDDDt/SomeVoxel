@@ -121,8 +121,9 @@ private:
         }
         auto &history = entry->second;
         if (history.last_contact == tick) return;
-        if (tick - history.last_contact > 1) {
-            const float gap = (tick - history.last_contact - 1) * dt;
+        const uint32_t sample_gap = tick - history.last_contact;
+        if (sample_gap > 2) {
+            const float gap = (sample_gap - 2) * dt;
             history.work *= std::max(0.f, 1.f - 6.f * gap);
         }
         history.last_contact = tick;
@@ -132,8 +133,9 @@ private:
         constexpr float closure_volume = 2.f * scale * scale * scale;
         constexpr float max_closure_rate = 3.f;
         const float threshold = sand_compaction_work(2, 2);
+        const float duration = (sample_gap == 2 && history.work > 0.f ? 2.f : 1.f) * dt;
         history.work = std::min(threshold,
-            history.work + (pressure - sand_yield_pressure) * closure_volume * max_closure_rate * dt);
+            history.work + (pressure - sand_yield_pressure) * closure_volume * max_closure_rate * duration);
         if (history.work >= threshold && tick >= history.retry_after && compaction_jobs.size() < 64) {
             record_compaction_load(anchor, {history.work, {}});
             history.retry_after = tick + std::max(1, simulation_hz / 15);
@@ -143,33 +145,42 @@ private:
     template <typename Fits>
     void sample_bearing_contact(const Grain &grain, I3 from, Kind kind, V3 acceleration, const Fits &fits) {
         if (kind != Sand && kind != Gravel && kind != Rock) return;
-        // Sample one of every eight loose grain sites. A sample describes the
-        // local packing region, avoiding per-particle pressure storage.
-        if (kind == Sand && ((from.x | from.y | from.z) & 1)) return;
-        int axis = 0;
-        if (std::abs(acceleration.y) > std::abs(acceleration.x)) axis = 1;
-        if (std::abs(acceleration.z) > std::abs(acceleration[axis])) axis = 2;
-        const float normal_acceleration = std::abs(acceleration[axis]);
+        // Rotate between opposite corners so one side of each packing cell
+        // is not permanently omitted.
+        const int corner = int(tick & 1u);
+        if (kind == Sand && (((from.x ^ corner) | (from.y ^ corner) | (from.z ^ corner)) & 1)) return;
         // One physical bearing layer approximates the load carried by
         // neighboring grains. A rigid packet uses its mass and face area.
         const float edge = scale * grain.extent;
         const float mass_per_area = kind == Sand ? sand_density * 0.12f
             : particle_mass(kind, grain) / (edge * edge);
-        const float pressure = mass_per_area * normal_acceleration;
-        if (pressure <= sand_yield_pressure) return;
-        const int direction = acceleration[axis] > 0.f ? 1 : -1;
-        if (grain.velocity[axis] * direction < -0.1f) return;
-        I3 neighbor = from;
-        neighbor[axis] += direction;
-        int obstacle = -1;
-        if (fits(neighbor, &obstacle) || obstacle < 0) return;
-        const Kind surface = voxels[obstacle].kind;
-        if (kind != Sand) {
-            if (surface == Sand) record_contact_pressure(decode(obstacle), pressure);
-            return;
+        const V3 internal = acceleration + V3(0, gravity, 0);
+        float best = sand_yield_pressure;
+        int bearing = -1;
+        for (int axis = 0; axis < 3; ++axis) {
+            // Adjacent sand shares gravity. Only a fixed support can turn
+            // common downward acceleration into contact load.
+            const float applied = mass_per_area * acceleration[axis];
+            const float relative = mass_per_area * internal[axis];
+            if (std::max(std::abs(applied), std::abs(relative)) <= best) continue;
+            for (int direction : {-1, 1}) {
+                if (std::max(applied * direction, relative * direction) <= best ||
+                        grain.velocity[axis] * direction < -0.1f) continue;
+                I3 neighbor = from;
+                neighbor[axis] += direction;
+                int obstacle = -1;
+                if (fits(neighbor, &obstacle) || obstacle < 0) continue;
+                const Kind surface = voxels[obstacle].kind;
+                const bool fixed = kind == Sand && retains_grain_face(obstacle);
+                if (surface != Sand && !(kind == Sand && (surface == Gravel || fixed))) continue;
+                const float pressure = (fixed || kind != Sand ? applied : relative) * direction;
+                if (pressure > best) {
+                    best = pressure;
+                    bearing = obstacle;
+                }
+            }
         }
-        if (surface == Sand || surface == Gravel || retains_grain_face(obstacle))
-            record_contact_pressure(from, pressure);
+        if (bearing >= 0) record_contact_pressure(kind == Sand ? from : decode(bearing), best);
     }
 
     void finish_contact_compaction() {

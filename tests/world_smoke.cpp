@@ -186,6 +186,38 @@ static bool packed_sand_forms(somevoxel::World &world) {
     return loose.count == 10 && loose.blocks == 0 && std::abs(loose.mass - before.mass) <= 0.0001f;
 }
 
+static bool compression_below_focus(somevoxel::World &world) {
+    using somevoxel::Vec3;
+    using somevoxel::World;
+    const int32_t layout[] = {
+        0, 0, 0, 130, 4, 130, World::Stone,
+        53, 4, 53, 66, 16, 66, World::Sand,
+        66, 4, 51, 68, 20, 68, World::Stone,
+        53, 4, 51, 66, 19, 53, World::Stone,
+        53, 4, 66, 66, 19, 68, World::Stone,
+    };
+    const Vec3 focus = Vec3(62.5f, 10.f, 59.5f) * world.status().cell_size;
+    for (const bool shaped : {false, true}) {
+        if (!world.load_boxes(layout, std::size(layout))) return false;
+        const auto initial = world.status();
+        world.set_cast_profile(1.f, 5.f);
+        if (shaped) world.set_particle_form(focus, {1, 0, 0}, World::Sand, 1, 1.5f, 5.f);
+        else world.set_field(focus, true);
+        world.set_charge_gather(1.f);
+        bool below = false;
+        for (int tick = 0; tick < 160; ++tick) {
+            world.step();
+            if (world.status().sand_mass != initial.sand_mass) return false;
+            if (world.range_count(World::Gravel, {0, 0, 0}, {130, 10, 130}) >= 8) {
+                below = true;
+                break;
+            }
+        }
+        if (!below) return false;
+    }
+    return true;
+}
+
 int main() {
     if (!water_head_selection()) {
         std::cerr << "Water head backend selection or GPU failure recovery failed\n";
@@ -271,4 +303,9 @@ int main() {
         return 1;
     }
     std::cout << "Forms lifted and launched every packed size and retained control across packing and fracture\n";
+    if (!compression_below_focus(world)) {
+        std::cerr << "Convergence failed to compact sand below the focus\n";
+        return 1;
+    }
+    std::cout << "Free and shaped convergence compacted supported sand below the focus\n";
 }
