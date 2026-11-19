@@ -140,8 +140,10 @@ private:
 
     void accumulate_site_pressure(int id, CompressionHistory &history, float pressure) {
         const uint32_t sample_gap = tick - history.last_contact;
-        if (sample_gap > 2) {
-            const float gap = (sample_gap - 2) * dt;
+        // A held grain can be selected once per eight sampling phases.
+        constexpr uint32_t sample_tolerance = 8;
+        if (sample_gap > sample_tolerance) {
+            const float gap = (sample_gap - sample_tolerance) * dt;
             history.work *= std::max(0.f, 1.f - 6.f * gap);
         }
         history.last_contact = tick;
@@ -152,7 +154,7 @@ private:
         constexpr float max_closure_rate = 3.f;
         const float threshold = sand_compaction_work(2, 2);
         const float porous_threshold = sand_compaction_work(2, 4);
-        const float duration = (sample_gap == 2 && history.work > 0.f ? 2.f : 1.f) * dt;
+        const float duration = (sample_gap <= sample_tolerance && history.work > 0.f ? sample_gap : 1u) * dt;
         history.work = std::min(porous_threshold,
             history.work + (pressure - sand_yield_pressure) * closure_volume * max_closure_rate * duration);
         if (history.work >= threshold && tick >= history.retry_after && compaction_jobs.size() < 64) {
@@ -161,13 +163,24 @@ private:
         }
     }
 
+    bool sample_sand_pressure_at(I3 from) const {
+        // Each pair of steps samples the same X/Z column from both sides
+        // in Y, rotating through all four columns.
+        const int phase = int(tick & 7u);
+        return (((from.x ^ (phase >> 1)) | (from.y ^ phase) | (from.z ^ (phase >> 2))) & 1) == 0;
+    }
+
     template <typename Fits>
     void sample_bearing_contact(const Grain &grain, I3 from, Kind kind, V3 acceleration, const Fits &fits) {
         if (kind != Sand && kind != Gravel && kind != Rock) return;
-        // Rotate between opposite corners so one side of each packing cell
-        // is not permanently omitted.
-        const int corner = int(tick & 1u);
-        if (kind == Sand && (((from.x ^ corner) | (from.y ^ corner) | (from.z ^ corner)) & 1)) return;
+        if (kind == Sand) {
+            if (voxels[grain.position].formed) {
+                if (!sample_sand_pressure_at(from)) return;
+            } else {
+                const int corner = int(tick & 1u);
+                if (((from.x ^ corner) | (from.y ^ corner) | (from.z ^ corner)) & 1) return;
+            }
+        }
         // One physical bearing layer approximates the load carried by
         // neighboring grains. A rigid packet uses its mass and face area.
         const float edge = scale * grain.extent;
@@ -208,18 +221,50 @@ private:
             return;
         }
         const I3 contact = decode(bearing);
-        record_contact_pressure(contact, best);
         // Follow a short, solid path into the load-bearing sand. A gap ends
         // the path. Updating only the far end bounds cache traffic per sample.
         constexpr int bearing_cells = int(0.18f / scale + 0.5f);
-        const float transmitted = best * 0.9f;
-        if (transmitted <= sand_yield_pressure) return;
         I3 inner = contact;
         for (int i = 1; i < bearing_cells; ++i) {
             if (kind_at(inner + normal) != Sand) break;
             inner += normal;
         }
-        if (inner != contact) record_contact_pressure(inner, transmitted);
+        // Grains travelling together do not load one another with the
+        // acceleration they share along the bearing path.
+        if (kind == Sand && voxels[grain.position].formed && voxels[flat(inner)].formed &&
+                inside(inner + normal) && !retains_grain_face(flat(inner + normal))) {
+            const int endpoint = flat(inner);
+            const Grain &receiver = grains[voxels[endpoint].occupant];
+            bool receiver_driven = false;
+            const V3 receiver_acceleration = field_drive(receiver, inner, Sand, &form_motion.at(endpoint), receiver_driven)
+                + wind_drive(receiver, inner, Sand);
+            if (receiver_driven)
+                best -= mass_per_area * std::max(0.f, receiver_acceleration.dot(V3(normal)));
+        }
+        if (best <= sand_yield_pressure) return;
+        // The bearing face loads the loose sand on both sides.
+        if (kind == Sand) record_contact_pressure(from, best);
+        record_contact_pressure(contact, best);
+        const float transmitted = best * 0.9f;
+        if (inner != contact && transmitted > sand_yield_pressure) record_contact_pressure(inner, transmitted);
+    }
+
+    void sample_held_sand_pressure() {
+        if (particle_form.material != Sand) return;
+        // Probe both ends of each contact against the same world state.
+        // The motion sweep updates occupied cells and velocities bottom-up.
+        for (const auto &[index, motion] : form_motion) {
+            if (motion.expires != 0 || voxels[index].kind != Sand) continue;
+            const I3 from = decode(index);
+            if (!sample_sand_pressure_at(from)) continue;
+            const Grain &grain = grains[voxels[index].occupant];
+            bool attracted = false;
+            const V3 acceleration = V3(0, -gravity, 0) + field_drive(grain, from, Sand, &motion, attracted)
+                + wind_drive(grain, from, Sand);
+            sample_bearing_contact(grain, from, Sand, acceleration, [&](I3 p, int *contact) {
+                return can_enter(p, Sand, contact);
+            });
+        }
     }
 
     void finish_contact_compaction() {

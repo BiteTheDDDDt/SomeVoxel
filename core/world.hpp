@@ -1351,16 +1351,9 @@ private:
         return true;
     }
 
-    // Integrate forces at a fixed rate. Sub-cell displacement accumulates
-    // until a face crossing can be committed to the shared occupancy grid.
-    template <typename Fits>
-    ParticlePath advance_particle(Grain &grain, I3 from, Kind kind, Fits fits,
-            FormMotion *form = nullptr, V3 external_acceleration = V3(), GravelLiquidMove *liquid = nullptr) {
-        const I3 down(0, -1, 0);
+    V3 field_drive(const Grain &grain, I3 from, Kind kind, const FormMotion *form, bool &attracted) const {
         const GranularMaterial material = granular_material(kind);
         const float density_ratio = gravel_density_ratio(grain);
-        V3 acceleration = V3(0, -gravity, 0) + external_acceleration;
-        bool attracted = false;
         if (form && form->expires == 0) {
             const V3 position = particle_center(from, grain.extent) + grain.travel;
             const V3 offset = form_destination(*form) - position;
@@ -1375,8 +1368,8 @@ private:
                     inward -= particle_form.right * (0.85f * inward.dot(particle_form.right));
                 spring += inward * gather;
             }
-            acceleration += spring * (110.f * response) - grain.velocity * (12.f * std::sqrt(response * (1.f + gather)));
             attracted = true;
+            return spring * (110.f * response) - grain.velocity * (12.f * std::sqrt(response * (1.f + gather)));
         } else if (!form && pulling && material.attraction_range > 0.f) {
             const V3 offset = field - particle_center(from, grain.extent) - grain.travel;
             const float reach = material.attraction_range * cast_radius_scale;
@@ -1387,26 +1380,44 @@ private:
                     const float falloff = std::clamp(2.f - offset.length_squared() / (focus * focus), 0.f, 1.f);
                     response *= 1.f + 2.2f * charge_gather * falloff;
                 }
-                acceleration += pull_acceleration(offset, grain.velocity, reach, response, 94.f, 13.f);
                 attracted = true;
+                return pull_acceleration(offset, grain.velocity, reach, response, 94.f, 13.f);
             }
         }
-        if (winding) {
-            const float pressure = wind_pressure(particle_center(from, grain.extent));
-            if (pressure > 0.f) {
-                const float drag = kind == Steam ? 2.5f :
-                    std::clamp(700.f / (material.density * density_ratio * grain.extent), 0.12f, 2.5f);
-                const V3 relative_wind = wind_direction * 30.f - grain.velocity;
-                acceleration += relative_wind * (2.f * drag * pressure);
-            }
-        }
-        sample_bearing_contact(grain, from, kind, acceleration, fits);
+        return {};
+    }
+
+    V3 wind_drive(const Grain &grain, I3 from, Kind kind) const {
+        if (!winding) return {};
+        const float pressure = wind_pressure(particle_center(from, grain.extent));
+        if (pressure <= 0.f) return {};
+        const float density = granular_material(kind).density * gravel_density_ratio(grain);
+        const float drag = kind == Steam ? 2.5f : std::clamp(700.f / (density * grain.extent), 0.12f, 2.5f);
+        return (wind_direction * 30.f - grain.velocity) * (2.f * drag * pressure);
+    }
+
+    // Integrate forces at a fixed rate. Sub-cell displacement accumulates
+    // until a face crossing can be committed to the shared occupancy grid.
+    template <typename Fits>
+    ParticlePath advance_particle(Grain &grain, I3 from, Kind kind, Fits fits,
+            FormMotion *form = nullptr, V3 external_acceleration = V3(), GravelLiquidMove *liquid = nullptr) {
+        const I3 down(0, -1, 0);
+        const GranularMaterial material = granular_material(kind);
+        V3 acceleration = V3(0, -gravity, 0) + external_acceleration;
+        bool attracted = false;
+        acceleration += field_drive(grain, from, kind, form, attracted);
+        acceleration += wind_drive(grain, from, kind);
+        if (kind != Sand || !form || form->expires != 0)
+            sample_bearing_contact(grain, from, kind, acceleration, fits);
         if (kind == Sand && !form && airborne_earth_ejecta.empty() && step_enclosed_sand(grain, from, acceleration, attracted))
             return {from, from};
         I3 slope;
         int support = -1;
+        // Held neighbors can move together downward. Use swept contact
+        // between them and keep the resting contact against the bulk bed.
         if (grain.velocity.y <= 0.f && acceleration.y <= 0.f && !fits(from + down, &support) &&
-                !(liquid && gravel_can_enter_water(grain, support))) {
+                !(liquid && gravel_can_enter_water(grain, support)) &&
+                !(form && attracted && kind == Sand && support >= 0 && voxels[support].formed)) {
             grain.travel.y = 0.f;
             grain.blocked_faces &= uint8_t(~grain_axis_faces(1));
             if (retains_grain_face(support)) grain.blocked_faces |= grain_face_bit(1, -1);
@@ -2008,11 +2019,20 @@ private:
                     candidate[v] = origin[v] + b;
                     if (!inside(candidate) || !accepts(candidate)) continue;
                     cells.push_back(flat(candidate));
-                    if (int(cells.size()) == needed) return true;
                 }
             }
         }
-        return false;
+        if (int(cells.size()) < needed) return false;
+        const auto rank = [&](int cell) {
+            const I3 offset = decode(cell) - origin;
+            const I3 delta = offset + offset - I3(extent - 1, extent - 1, extent - 1);
+            const int distance_squared = delta.x * delta.x + delta.y * delta.y + delta.z * delta.z;
+            return std::make_pair(distance_squared, hash(uint32_t(cell)));
+        };
+        std::partial_sort(cells.begin(), cells.begin() + needed, cells.end(),
+            [&](int a, int b) { return rank(a) < rank(b); });
+        cells.resize(needed);
+        return true;
     }
 
 public:

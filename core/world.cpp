@@ -337,6 +337,7 @@ void World::step() {
     prepare_particle_forms();
     if (pulling) wake_field();
     if (water_tick) refresh_liquid_head();
+    sample_held_sand_pressure();
     active_count = 0;
     step_gravel();
     const auto sweep_start = profile_sand_sweep ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
