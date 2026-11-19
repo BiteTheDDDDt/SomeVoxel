@@ -14,6 +14,8 @@ In a CMake consumer, use `add_subdirectory` and link `SomeVoxel::Core`. Include 
 
 The default grid has 4.5 cm cells and runs at 120 Hz. Its dimensions and refinement are build settings. The API is experimental.
 
+Settled liquids share one cell-transfer pass. Each material supplies the flow cadence, downhill reach and pressure approximation. The connected-head profile uses the existing parallel water-head backend. The local-column profile tests the material immediately above the cell. Active parcels use the common swept integrator with their own force and drag settings.
+
 Fresh Windows, Linux and macOS builds default to four workers for water-head rebuilds and sand rendering. At refinement 18 and higher, water-head rebuilds default to eight. Override `SOMEVOXEL_PARALLEL_WATER_WORKERS` and `SOMEVOXEL_PARALLEL_RENDER_WORKERS` at configure time, or set either to an empty string for its serial implementation. At runtime, `set_water_workers(n)` selects a limit per world, with 0 for all detected logical processors and −1 for the build default. `water_worker_count()` includes the calling thread. Pressure checks can reuse the packed component surfaces until the water topology changes. When a connected surface can discharge, the solver uses the original sequential parcel routes.
 
 Enable `set_sand_sweep_profiling(true)` to collect the latest step's row visits, loose-sand integration count, face attempts, face crossings, contact count and sweep time. Read the counters with `sand_sweep_stats()`. The Godot bridge returns the same fields as a dictionary.

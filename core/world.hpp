@@ -1419,7 +1419,7 @@ private:
         }
     }
 
-    bool step_element_particle(I3 p, const Voxel &voxel) {
+    void step_element_particle(I3 p, const Voxel &voxel) {
         const Kind kind = voxel.kind;
         Grain &grain = element_grains[element_grain_slot(kind)][voxel.occupant];
         V3 acceleration;
@@ -1431,7 +1431,7 @@ private:
                 grain.velocity = V3();
                 grain.travel = V3();
                 grain.blocked_faces = 0;
-                return true;
+                return;
             }
             if (pulled) acceleration = pull_acceleration(offset, grain.velocity, reach, 1.f, 94.f, 11.f);
         } else if (kind == Steam) {
@@ -1444,25 +1444,12 @@ private:
                         acceleration += V3(side) * 11.f;
                 }
             }
-        } else if (kind == Lava) {
-            const float reach = granular_material(Lava).attraction_range * cast_radius_scale;
-            const bool driven = pulling && (field - center(p) - grain.travel).length_squared() < reach * reach;
-            // A free lower face starts a fall even from rest. Only settled,
-            // supported lava can use the coarse bulk flow.
-            if (!driven && grain.velocity.length_squared() < 0.0025f && !can_enter(p + I3(0, -1, 0), Lava)) {
-                grain.velocity = V3();
-                grain.travel = V3();
-                grain.blocked_faces = 0;
-                return false;
-            }
-            acceleration = -grain.velocity * 8.f;
         }
         const ParticlePath path = advance_particle(grain, p, kind, [&](I3 candidate, int *contact = nullptr) {
             const bool rising = kind == Steam && candidate.y > p.y && candidate.x == p.x && candidate.z == p.z;
             return can_enter(candidate, kind, contact, rising);
         }, nullptr, acceleration);
         commit_particle_path(p, path);
-        return true;
     }
 
     void update_voxel(I3 p, int index) {
@@ -1489,37 +1476,11 @@ private:
             commit_particle_path(p, path);
             return;
         }
-        if (element_particle(kind) && step_element_particle(p, voxel)) return;
-        if (kind != Water && kind != Lava) return;
-        if (kind == Water && step_liquid_motion(p, index)) return;
-        const bool fluid_tick = kind == Water ? water_tick : tick % reaction_interval == 0;
-        if (!fluid_tick) {
-            next_awake[chunk_id({p.x / block, p.y / block, p.z / block})] = true;
-            return;
+        if (const auto *material = bulk_liquid_material(kind)) {
+            step_liquid(p, index, voxel, *material);
+        } else if (element_particle(kind)) {
+            step_element_particle(p, voxel);
         }
-        const I3 lower(0, -1, 0);
-        if (can_enter(p + lower, kind)) {
-            move(p, p + lower);
-            return;
-        }
-        const auto dirs = cardinal();
-        const int start = hash(uint32_t(index) ^ (tick * 0x9e3779b9u)) & 3u;
-        I3 level = p;
-        for (int i = 0; i < 4; ++i) {
-            const I3 side = p + dirs[(start + i) & 3];
-            if (!can_enter(side, kind)) continue;
-            if (can_enter(side + lower, kind)) {
-                if (kind == Lava) move(p, side);
-                else move_across_two_faces(p, side, side + lower);
-                return;
-            }
-            if (level == p || kind_at(side + I3(0, -1, 0)) == Empty) level = side;
-        }
-        // Pressurized water fans out sideways. A single idle surface layer can
-        // settle instead of shuffling continuously across a level floor.
-        if (level != p && (kind == Water ? liquid_head.get(p) > p.y + 1
-                                         : kind_at(p + I3(0, 1, 0)) == Lava))
-            move(p, level);
     }
 
 public:
@@ -2331,6 +2292,7 @@ public:
 #include "detail/voxel_reactions.hpp"
 #include "detail/voxel_liquid_pressure.hpp"
 #include "detail/voxel_liquid_motion.hpp"
+#include "detail/voxel_bulk_liquid.hpp"
 #include "detail/voxel_gravel_liquid.hpp"
 #include "detail/voxel_humidity.hpp"
 #include "detail/voxel_forms.hpp"
