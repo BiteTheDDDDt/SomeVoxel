@@ -154,6 +154,7 @@ int main(int argc, char **argv) {
     std::vector<double> samples;
     somevoxel::ThrowInfo held;
     int launched = 0;
+    double release_ms = 0.;
     for (int batch = 0; batch < batch_hz * duration; ++batch) {
         const int frame = batch / (batch_hz / input_hz);
         if (has_sand && batch % (batch_hz / input_hz) == 0) {
@@ -163,8 +164,10 @@ int main(int argc, char **argv) {
                 world.set_charge_gather(charge);
                 world.set_field(field_start.lerp(field_end, t * t * (3.f - 2.f * t)), true);
             } else if (frame == release) {
-                held = world.free_sand_throw(field_end, 3.f, 1.f);
-                launched = world.launch_free_sand(field_end, {1.f, 0.f, 0.f}, 3.f, 1.f);
+                const auto release_started = Clock::now();
+                held = world.launch_free_sand_report(field_end, {1.f, 0.f, 0.f}, 3.f, 1.f);
+                release_ms = std::chrono::duration<double, std::milli>(Clock::now() - release_started).count();
+                launched = held.count;
                 world.set_field(field_end, false);
                 world.set_charge_gather(0.f);
             }
@@ -195,7 +198,7 @@ int main(int argc, char **argv) {
         << ",\"p99_ms\":" << percentile(samples, 0.99) << ",\"conserved\":" << conserved
         << ",\"sand_mass_cells\":" << final.sand_mass << ",\"water_cells\":" << final.water_volume
         << ",\"water_out_m3\":" << escaped * cell_volume << ",\"water_out_l\":" << water_out_l
-        << ",\"water_net_flow_l_s\":" << water_net_flow_l_s << ",\"launched\":" << launched
+        << ",\"water_net_flow_l_s\":" << water_net_flow_l_s << ",\"release_ms\":" << release_ms << ",\"launched\":" << launched
         << ",\"cast_mass_kg\":" << held.mass << ",\"cast_speed_m_s\":" << held.speed
         << ",\"cast_impulse_ns\":" << double(held.mass) * held.speed
         << ",\"cast_center\":[" << held.position.x << ',' << held.position.y << ',' << held.position.z << ']'

@@ -23,6 +23,8 @@ Build `somevoxel_rate_bench` with `-DSOMEVOXEL_BUILD_EXPERIMENTS=ON` and the gri
 
 `mixed` replays five simulated seconds of reservoir flow and a charged shot. The report gives the mass at release in kilograms, the impulse of the fastest qualifying sand contact in N·s and N·s per square meter of the contact face, and stone fracture volume in liters. As an estimate of the impulse applied at release, `cast_impulse_ns` multiplies released mass by the mass-weighted velocity increment. Use `water`, `water-mirrored`, `water-narrow`, and `water-narrow-mirrored` to compare tank outlets. `water_net_flow_l_s` is the final water volume beyond the fixed outlet plane divided by elapsed simulated seconds. It measures net discharge over the test window.
 
+`release_ms` measures selection, throw summary and impulse application separately from the physics-step samples. In seven alternating runs of the 4.5 cm sand fixture, the median fell from 0.440 ms with preview followed by launch to 0.250 ms with a single release. The number launched, mass, contact impulse and fracture volume matched.
+
 `paged_material_grid.py` checks initial occupancy on CUDA for fixed scene
 bounds. It accepts JSON lines with a `layout` identifier and flat
 `boxes` records in `[x0,y0,z0,x1,y1,z1,kind]` order. Uniform static pages

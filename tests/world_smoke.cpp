@@ -133,6 +133,28 @@ static bool pressure_api(somevoxel::World &world) {
     return true;
 }
 
+static bool water_recruitment_locality(somevoxel::World &world) {
+    using somevoxel::Vec3;
+    using somevoxel::World;
+    const int32_t layout[] = {
+        44, 28, 44, 52, 32, 52, World::Water,
+        120, 12, 118, 146, 29, 143, World::Water,
+    };
+    if (!world.load_boxes(layout, std::size(layout))) return false;
+    const auto before = world.status();
+    const float pitch = before.cell_size;
+    // The nearby parcel is within reach of the handle, far from the tip.
+    const Vec3 handle = Vec3(41.f, 30.f, 48.f) * pitch;
+    const Vec3 tip = Vec3(104.f, 30.f, 48.f) * pitch;
+    world.set_sand_sweep_profiling(true);
+    world.set_particle_form(tip, {1.f, 0.f, 0.f}, World::Water, 3, 0.36f, 1.f, handle);
+    world.step();
+    const auto scanned = world.sand_sweep_stats().water_form_scanned;
+    world.set_sand_sweep_profiling(false);
+    return world.particle_form_count() >= 10 && scanned > 0 && scanned < before.water_volume / 4 &&
+        world.status().water_volume == before.water_volume;
+}
+
 static bool sand_locality(somevoxel::World &world) {
     using somevoxel::Vec3;
     using somevoxel::World;
@@ -390,6 +412,11 @@ int main() {
         return 1;
     }
     std::cout << "Sand locality skipped stable interiors and recruited from nearby chunks\n";
+    if (!water_recruitment_locality(world)) {
+        std::cerr << "Water recruitment missed the whip handle or swept a distant reservoir\n";
+        return 1;
+    }
+    std::cout << "Water recruitment found the whip handle using local chunks\n";
     if (!sustained_compression(world)) {
         std::cerr << "Sustained contact failed to distinguish gentle and strong compression\n";
         return 1;

@@ -28,7 +28,10 @@ void World::recruit_form_particles() {
     const V3 line = particle_form.point - particle_form.handle;
     const float inverse_length = whip ? 1.f / std::max(0.000001f, line.length_squared()) : 0.f;
     const auto consider = [&](int i, int extent, float search_squared) {
-        if (profile_sand_sweep && particle_form.material == Sand) ++sand_sweep.form_scanned;
+        if (profile_sand_sweep) {
+            if (particle_form.material == Water) ++sand_sweep.water_form_scanned;
+            else ++sand_sweep.form_scanned;
+        }
         if (voxels[i].formed || cube_cells(extent) > available_cells) return;
         const V3 sample = particle_center(decode(i), extent);
         const float nearest = whip ? std::clamp((sample - particle_form.handle).dot(line) * inverse_length, 0.f, 1.f) : 1.f;
@@ -36,42 +39,54 @@ void World::recruit_form_particles() {
         if (distance > search_squared) return;
         form_candidates.emplace_back(distance, i);
     };
-    if (particle_form.material == Water) {
-        for (int i : water_positions) consider(i, 1, reach_squared);
-    } else {
-        if (grains.size() <= 4096) {
-            for (const Grain &grain : grains) consider(grain.position, 1, reach_squared);
+    const Kind material = particle_form.material;
+    const bool water = material == Water;
+    const auto &chunk_counts = water ? water_chunk_counts : sand_chunk_counts;
+    if ((water ? water_positions.size() : grains.size()) <= 4096) {
+        if (water) {
+            for (int i : water_positions) consider(i, 1, reach_squared);
         } else {
-            // Fine candidates outside the current sphere cannot outrank
-            // the full shortlist. Packed anchors are considered separately.
-            for (float radius = std::min(particle_form.radius, block * scale);;) {
-                form_candidates.clear();
-                const V3 reach(radius, radius, radius);
-                const I3 lo = grid(particle_form.point - reach);
-                const I3 hi = grid(particle_form.point + reach);
-                const float search_squared = radius * radius;
-                for (int cy = std::max(0, lo.y) / block; cy <= std::min(ny - 1, hi.y) / block; ++cy)
-                    for (int cz = std::max(0, lo.z) / block; cz <= std::min(nz - 1, hi.z) / block; ++cz)
-                        for (int cx = std::max(0, lo.x) / block; cx <= std::min(nx - 1, hi.x) / block; ++cx) {
-                            const I3 chunk(cx, cy, cz);
-                            if (!sand_chunk_counts[chunk_id(chunk)] ||
-                                    chunk_distance_squared(chunk, particle_form.point) > search_squared) continue;
-                            const I3 start = chunk * block;
-                            for (int y = start.y; y < std::min(ny, start.y + block); ++y)
-                                for (int z = start.z; z < start.z + block; ++z) {
-                                    const int base = flat({start.x, y, z});
-                                    for (unsigned bits = mobile_rows[base / block]; bits; bits &= bits - 1) {
-                                        const int id = base + next_row_cell(bits, false);
-                                        if (voxels[id].kind == Sand) consider(id, 1, search_squared);
-                                    }
-                                }
-                        }
-                if (int(form_candidates.size()) >= limit || radius == particle_form.radius) break;
-                radius = std::min(radius * 2.f, particle_form.radius);
-            }
+            for (const Grain &grain : grains) consider(grain.position, 1, reach_squared);
         }
-        for (const Grain &grain : gravel) consider(grain.position, grain.extent, reach_squared);
+    } else {
+        // A full shortlist inside this radius cannot be displaced by
+        // farther unit grains. Packed bodies are considered separately.
+        const V3 origin = whip ? particle_form.handle : particle_form.point;
+        const V3 tip = particle_form.point;
+        const V3 minimum(std::min(origin.x, tip.x), std::min(origin.y, tip.y), std::min(origin.z, tip.z));
+        const V3 maximum(std::max(origin.x, tip.x), std::max(origin.y, tip.y), std::max(origin.z, tip.z));
+        for (float radius = std::min(particle_form.radius, block * scale);;) {
+            form_candidates.clear();
+            const V3 reach(radius, radius, radius);
+            const I3 lo = grid(minimum - reach), hi = grid(maximum + reach);
+            const float search_squared = radius * radius;
+            const float capsule_bound = radius + 0.867f * block * scale;
+            for (int cy = std::max(0, lo.y) / block; cy <= std::min(ny - 1, hi.y) / block; ++cy)
+                for (int cz = std::max(0, lo.z) / block; cz <= std::min(nz - 1, hi.z) / block; ++cz)
+                    for (int cx = std::max(0, lo.x) / block; cx <= std::min(nx - 1, hi.x) / block; ++cx) {
+                        const I3 chunk(cx, cy, cz);
+                        if (!chunk_counts[chunk_id(chunk)]) continue;
+                        const I3 start = chunk * block;
+                        if (whip) {
+                            const V3 midpoint = particle_center(start, block);
+                            const float t = std::clamp((midpoint - origin).dot(line) * inverse_length, 0.f, 1.f);
+                            if (midpoint.distance_squared_to(origin + line * t) > capsule_bound * capsule_bound) continue;
+                        } else if (chunk_distance_squared(chunk, tip) > search_squared) continue;
+                        for (int y = start.y; y < std::min(ny, start.y + block); ++y)
+                            for (int z = start.z; z < start.z + block; ++z) {
+                                const int base = flat({start.x, y, z});
+                                for (unsigned bits = mobile_rows[base / block]; bits; bits &= bits - 1) {
+                                    const int id = base + next_row_cell(bits, false);
+                                    if (voxels[id].kind == material) consider(id, 1, search_squared);
+                                }
+                            }
+                    }
+            if (int(form_candidates.size()) >= limit || radius == particle_form.radius) break;
+            radius = std::min(radius * 2.f, particle_form.radius);
+        }
     }
+    if (!water)
+        for (const Grain &grain : gravel) consider(grain.position, grain.extent, reach_squared);
     if (int(form_candidates.size()) > limit) {
         std::nth_element(form_candidates.begin(), form_candidates.begin() + limit, form_candidates.end());
         form_candidates.resize(limit);

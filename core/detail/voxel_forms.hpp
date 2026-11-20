@@ -510,24 +510,73 @@ public:
         return sample.result(speed + charge_speed_increment(sample.mass, speed, sample.fastest, charge));
     }
 
-    int launch_free_sand(V3 point, V3 direction, float impulse_scale = 1.f, float charge = 0.f) {
+private:
+    ThrowInfo release_free_sand(V3 point, V3 direction, float impulse_scale, float charge, const V3 *target) {
         const float length_squared = direction.length_squared();
         if (!std::isfinite(impulse_scale) || !std::isfinite(charge) || !std::isfinite(length_squared) || length_squared < 0.00001f)
-            return 0;
+            return {};
         const FreeSandCandidates candidates = free_sand_candidates(point);
-        direction /= std::sqrt(length_squared);
+        if (candidates.fine.empty() && candidates.blocks.empty()) return {};
         const float fine_speed = loose_sand_speed(impulse_scale);
-        float boost = 0.f;
-        if (charge > 0.f) {
-            const ThrowSample sample = sample_free_sand(candidates, impulse_scale, fine_speed);
-            boost = charge_speed_increment(sample.mass, sample.speed(), sample.fastest, charge);
+        const ThrowSample sample = sample_free_sand(candidates, impulse_scale, fine_speed);
+        const float boost = charge_speed_increment(sample.mass, sample.speed(), sample.fastest, charge);
+        const ThrowInfo result = sample.result(sample.speed() + boost);
+        if (target) {
+            const V3 offset = *target - result.position;
+            if (target->is_finite() && offset.length_squared() > 0.04f)
+                direction = particle_launch_direction(offset, result.speed, result.velocity);
+            else
+                direction = direction * (result.speed + std::max(0.f, result.velocity.dot(direction))) - result.velocity;
         }
+        const float launch_length = direction.length_squared();
+        if (!std::isfinite(launch_length) || launch_length < 0.00001f) return {};
+        direction /= std::sqrt(launch_length);
         for (const auto &candidate : candidates.fine) apply_sand_throw(grains[candidate.second], direction, fine_speed + boost);
         for (const auto &candidate : candidates.blocks) {
             Grain &grain = gravel[candidate.second];
             apply_sand_throw(grain, direction, free_sand_block_speed(grain, impulse_scale, fine_speed) + boost);
         }
-        return int(candidates.fine.size() + candidates.blocks.size());
+        return result;
+    }
+
+public:
+    static V3 particle_launch_direction(V3 offset, float speed, V3 velocity) {
+        if (!offset.is_finite() || !std::isfinite(speed) || !velocity.is_finite()) return {};
+        const float distance = offset.length();
+        if (distance < 0.05f || speed < 0.1f) return offset.normalized();
+        const V3 half_gravity(0.f, gravity * 0.5f, 0.f);
+        const float speed_squared = speed * speed;
+        const float velocity_length = velocity.length();
+        float lower = std::max(distance / (speed + velocity_length) * 0.40f, 0.002f);
+        float upper = lower;
+        const float limit = 2.f + (speed + velocity_length) / half_gravity.y;
+        const auto impulse = [&](float time) { return offset / time + half_gravity * time - velocity; };
+        while (upper < limit) {
+            upper *= 1.16f;
+            if (impulse(upper).length_squared() <= speed_squared) {
+                for (int i = 0; i < 16; ++i) {
+                    const float middle = (lower + upper) * 0.5f;
+                    if (impulse(middle).length_squared() <= speed_squared) upper = middle;
+                    else lower = middle;
+                }
+                return impulse(upper).normalized();
+            }
+            lower = upper;
+        }
+        const float estimate = distance / std::max(speed + velocity.dot(offset.normalized()), 0.5f);
+        return impulse(estimate).normalized();
+    }
+
+    ThrowInfo launch_free_sand_report(V3 point, V3 direction, float impulse_scale = 1.f, float charge = 0.f) {
+        return release_free_sand(point, direction, impulse_scale, charge, nullptr);
+    }
+
+    ThrowInfo launch_free_sand_aimed(V3 point, V3 ray, V3 target, float impulse_scale = 1.f, float charge = 0.f) {
+        return release_free_sand(point, ray.normalized(), impulse_scale, charge, &target);
+    }
+
+    int launch_free_sand(V3 point, V3 direction, float impulse_scale = 1.f, float charge = 0.f) {
+        return launch_free_sand_report(point, direction, impulse_scale, charge).count;
     }
 
     void set_particle_form(V3 point, V3 direction, int material, int form, float radius, float strength, V3 origin = V3()) {

@@ -113,6 +113,10 @@ protected:
             &VoxelWorld::free_sand_throw, DEFVAL(1.f), DEFVAL(0.f));
         ClassDB::bind_method(D_METHOD("launch_free_sand", "point", "direction", "impulse_scale", "charge"),
             &VoxelWorld::launch_free_sand, DEFVAL(1.f), DEFVAL(0.f));
+        ClassDB::bind_method(D_METHOD("launch_free_sand_aimed", "point", "ray", "target", "impulse_scale", "charge"),
+            &VoxelWorld::launch_free_sand_aimed, DEFVAL(1.f), DEFVAL(0.f));
+        ClassDB::bind_method(D_METHOD("particle_launch_direction", "offset", "speed", "velocity"),
+            &VoxelWorld::particle_launch_direction);
         ClassDB::bind_method(D_METHOD("particle_form_count"), &VoxelWorld::particle_form_count);
         ClassDB::bind_method(D_METHOD("particle_form_tip"), &VoxelWorld::particle_form_tip);
         ClassDB::bind_method(D_METHOD("particle_form_speed", "impulse_scale"), &VoxelWorld::particle_form_speed, DEFVAL(1.f));
@@ -131,6 +135,7 @@ public:
         result["empty_rows"] = stats.empty_rows;
         result["settled_skipped"] = stats.settled_skipped;
         result["form_scanned"] = stats.form_scanned;
+        result["water_form_scanned"] = stats.water_form_scanned;
         result["integrated"] = stats.integrated;
         result["tested_faces"] = stats.tested_faces;
         result["crossed_faces"] = stats.crossed_faces;
@@ -472,6 +477,15 @@ public:
 
     int launch_free_sand(V3 point, V3 direction, float impulse_scale, float charge) {
         return world.launch_free_sand(somevoxel::from_godot(point), somevoxel::from_godot(direction), impulse_scale, charge);
+    }
+
+    godot::Dictionary launch_free_sand_aimed(V3 point, V3 ray, V3 target, float impulse_scale, float charge) {
+        return throw_summary(world.launch_free_sand_aimed(from_godot(point), from_godot(ray), from_godot(target),
+            impulse_scale, charge));
+    }
+
+    V3 particle_launch_direction(V3 offset, float speed, V3 velocity) const {
+        return to_godot(World::particle_launch_direction(from_godot(offset), speed, from_godot(velocity)));
     }
 
     int particle_form_count() const {
