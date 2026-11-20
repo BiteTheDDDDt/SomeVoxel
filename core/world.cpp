@@ -5,7 +5,7 @@
 
 namespace somevoxel {
 
-// Each occupied row has at most eight bits. Callers skip empty masks.
+// Callers skip empty masks.
 static int next_row_cell(unsigned row, bool descending) {
 #ifdef _MSC_VER
     unsigned long index;
@@ -333,7 +333,7 @@ bool World::load_boxes(const int32_t *layout, size_t length) {
         [](uint16_t count) { return count == block * block * block; });
     for (int i : element_cells(Vine))
         vine_roots[voxels[i].occupant] = vine_touches_anchor(decode(i));
-    awake.fill(true);
+    awake.set_all();
     reset_terrain_fractures();
     reset_elements();
     reset_fire_jet();
@@ -428,7 +428,7 @@ void World::step() {
     moved_rock = 0;
     moved_water_form = 0;
     debris_moved.fill(false);
-    next_awake.fill(false);
+    next_awake.clear();
     prepare_particle_forms();
     if (pulling) wake_field();
     if (water_tick) refresh_liquid_head();
@@ -441,18 +441,26 @@ void World::step() {
     // The traversal within each row stays bottom-up and alternates X/Z.
     std::array<I3, bx * bz> slab_chunks;
     const bool allow_settled_sand = !winding && airborne_earth_ejecta.empty();
+    std::chrono::steady_clock::duration collect_time{};
     for (int cy = 0; cy < by; ++cy) {
+        const auto collect_start = profile_sand_sweep ? std::chrono::steady_clock::now()
+                                                     : std::chrono::steady_clock::time_point{};
         int count = 0;
         for (int zi = 0; zi < bz; ++zi) {
             const int cz = reverse_z ? bz - 1 - zi : zi;
-            for (int xi = 0; xi < bx; ++xi) {
-                const int cx = reverse_x ? bx - 1 - xi : xi;
-                const I3 chunk(cx, cy, cz);
-                if (!awake[chunk_id(chunk)]) continue;
-                if (allow_settled_sand) certify_settled_sand(chunk);
-                slab_chunks[count++] = chunk;
+            for (int wi = 0; wi < ChunkActivity::row_words; ++wi) {
+                const int word = reverse_x ? ChunkActivity::row_words - 1 - wi : wi;
+                unsigned mask = awake.word(cy, cz, word);
+                while (mask) {
+                    const int lane = next_row_cell(mask, reverse_x);
+                    mask &= ~(1u << lane);
+                    slab_chunks[count++] = {word * 32 + lane, cy, cz};
+                }
             }
         }
+        if (profile_sand_sweep) collect_time += std::chrono::steady_clock::now() - collect_start;
+        if (allow_settled_sand)
+            for (int entry = 0; entry < count; ++entry) certify_settled_sand(slab_chunks[entry]);
         active_count += count;
         for (int y = cy * block; y < std::min(ny, (cy + 1) * block); ++y) {
             for (int entry = 0; entry < count; ++entry) {
@@ -483,7 +491,7 @@ void World::step() {
                         if (defer_bulk_water) {
                             // These cells can only keep this chunk scheduled
                             // until the next bulk update. Moving water is still integrated.
-                            next_awake[chunk_id(chunk)] = true;
+                            next_awake.set(chunk);
                             mask &= ~unsigned(bulk_water_rows[row_id]);
                         } else if (bulk_water_rows[row_id] == full_row &&
                                 row.x > 0 && row.x + block < nx && row.z > 0 && row.z < nz - 1 && row.y > 0 &&
@@ -526,10 +534,11 @@ void World::step() {
         }
     }
     if (profile_sand_sweep) {
+        sand_sweep.collect_us = std::chrono::duration_cast<std::chrono::microseconds>(collect_time).count();
         sand_sweep.time_us = std::chrono::duration_cast<std::chrono::microseconds>(
             std::chrono::steady_clock::now() - sweep_start).count();
     }
-    awake = next_awake;
+    awake.swap(next_awake);
     finish_packed_fractures();
     finish_contact_compaction();
     finish_terrain_fractures();

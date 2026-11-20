@@ -244,7 +244,45 @@ private:
     int water_displaced = 0;
     PagedField<SupportStamp, size_t(nx) * ny * nz> support_seen;
     SupportStamp support_epoch = 0;
-    std::array<bool, chunk_count> awake{}, next_awake{};
+    // Pad every X row so head workers that own different Z chunks never
+    // update the same word, even when the world width is not a multiple of 32.
+    class ChunkActivity {
+        static constexpr int words_per_row = (bx + 31) / 32;
+        std::vector<uint32_t> rows = std::vector<uint32_t>(size_t(by) * bz * words_per_row);
+
+    public:
+        static constexpr int row_words = words_per_row;
+        static constexpr size_t bytes = size_t(by) * bz * words_per_row * sizeof(uint32_t);
+
+        void set(I3 chunk) {
+            auto &row = rows[(chunk.y * bz + chunk.z) * words_per_row + chunk.x / 32];
+            const uint32_t flag = uint32_t(1) << (chunk.x % 32);
+            if (!(row & flag)) row |= flag;
+        }
+
+        void set_for_cell(I3 p) { set({p.x / block, p.y / block, p.z / block}); }
+
+        bool test(I3 chunk) const {
+            return (word(chunk.y, chunk.z, chunk.x / 32) & (uint32_t(1) << (chunk.x % 32))) != 0;
+        }
+
+        uint32_t word(int y, int z, int index) const {
+            return rows[(y * bz + z) * words_per_row + index];
+        }
+
+        void clear() { std::fill(rows.begin(), rows.end(), 0); }
+
+        void set_all() {
+            std::fill(rows.begin(), rows.end(), ~uint32_t(0));
+            if constexpr (bx % 32 != 0) {
+                for (size_t i = words_per_row - 1; i < rows.size(); i += words_per_row)
+                    rows[i] = (uint32_t(1) << (bx % 32)) - 1;
+            }
+        }
+
+        void swap(ChunkActivity &other) { rows.swap(other.rows); }
+    };
+    ChunkActivity awake, next_awake;
     std::array<bool, patch_x * patch_z> water_dirty{};
     std::array<bool, stone_patch_x * stone_patch_z> stone_dirty{};
     bool track_water_patches = true;
@@ -419,20 +457,19 @@ private:
         if (track_water_patches) dirty_surface<patch_width, patch_x>(p, water_dirty);
     }
 
-    void wake_box(I3 first, I3 last, std::array<bool, chunk_count> &chunks) {
+    void wake_box(I3 first, I3 last, ChunkActivity &chunks) {
         const I3 lo(std::max(0, first.x - 1) / block, std::max(0, first.y - 1) / block, std::max(0, first.z - 1) / block);
         const I3 hi(std::min(nx - 1, last.x + 1) / block, std::min(ny - 1, last.y + 1) / block, std::min(nz - 1, last.z + 1) / block);
         for (int y = lo.y; y <= hi.y; ++y)
             for (int z = lo.z; z <= hi.z; ++z)
-                for (int x = lo.x; x <= hi.x; ++x) chunks[chunk_id({x, y, z})] = true;
+                for (int x = lo.x; x <= hi.x; ++x) chunks.set({x, y, z});
     }
 
-    void wake_near(I3 p, std::array<bool, chunk_count> &chunks) {
-        const int id = chunk_at(p);
+    void wake_near(I3 p, ChunkActivity &chunks) {
         // An interior cell and all of its neighbors are in the same chunk.
         const int x = p.x & (block - 1), y = p.y & (block - 1), z = p.z & (block - 1);
         if (x > 0 && x < block - 1 && y > 0 && y < block - 1 && z > 0 && z < block - 1) {
-            chunks[id] = true;
+            chunks.set_for_cell(p);
             return;
         }
         wake_box(p, p, chunks);
@@ -462,7 +499,7 @@ private:
                     const float dx = outside(field.x, x);
                     if (dx * dx <= x_budget) {
                         const int id = chunk_id({x, y, z});
-                        awake[id] = true;
+                        awake.set({x, y, z});
                         settled_sand_chunks[id] = false;
                     }
                 }
@@ -1034,11 +1071,11 @@ private:
         for (int y = lo.y; y <= hi.y; ++y)
             for (int z = lo.z; z <= hi.z; ++z)
                 for (int x = lo.x; x <= hi.x; ++x)
-                    if (awake[chunk_id({x, y, z})]) return true;
+                    if (awake.test({x, y, z})) return true;
         return false;
     }
 
-    void move_gravel(int id, I3 target, std::array<bool, chunk_count> &wake,
+    void move_gravel(int id, I3 target, ChunkActivity &wake,
             const GravelLiquidMove *liquid = nullptr) {
         Grain &grain = gravel[id];
         const int origin = grain.position;
@@ -1163,7 +1200,7 @@ private:
             const float shared = (grain.velocity[axis] * mass + other.velocity[axis] * mass) / (mass + mass);
             grain.velocity[axis] = other.velocity[axis] = shared;
             const int chunk = chunk_at(attempted);
-            next_awake[chunk] = true;
+            next_awake.set_for_cell(attempted);
             settled_sand_chunks[chunk] = false;
         }
     }
@@ -1223,7 +1260,7 @@ private:
         other->velocity[axis] = shared_speed;
         if (other_kind == Sand) settled_sand_chunks[chunk_at(decode(blocking_voxel))] = false;
         const I3 p = kind == Gravel ? decode(blocking_voxel) : attempted;
-        next_awake[chunk_at(p)] = true;
+        next_awake.set_for_cell(p);
     }
 
     struct ParticlePath {
@@ -1416,7 +1453,7 @@ private:
             grain.travel[axis] = 0.f;
         }
         if (grain.velocity.length_squared() > 0.0009f || (acceleration.length_squared() > 0.01f && attracted))
-            next_awake[chunk_at(p)] = true;
+            next_awake.set_for_cell(p);
         return true;
     }
 
@@ -1521,7 +1558,7 @@ private:
         if (grain.velocity == V3() && acceleration == V3()) return {from, from};
         const ParticlePath path = sweep_particle(grain, from, kind, acceleration, fits, form, liquid);
         if (grain.velocity.length_squared() > 0.0009f || (acceleration.length_squared() > 0.01f && attracted))
-            next_awake[chunk_id({path.target.x / block, path.target.y / block, path.target.z / block})] = true;
+            next_awake.set_for_cell(path.target);
         return path;
     }
 
@@ -2336,7 +2373,7 @@ public:
         data.voxel_bytes = sizeof(Voxel);
         data.grain_bytes = sizeof(Grain);
         data.dense_grid_bytes = voxels.size() * sizeof(Voxel) + mobile_rows.size() + mobile_row_groups.size() + bulk_water_rows.size() +
-            (water_chunk_counts.size() + sand_chunk_counts.size()) * sizeof(uint16_t) + settled_sand_chunks.size() +
+            (water_chunk_counts.size() + sand_chunk_counts.size()) * sizeof(uint16_t) + settled_sand_chunks.size() + 2 * ChunkActivity::bytes +
             liquid_head.bytes() + previous_water_heads.capacity() * sizeof(LiquidHead) +
             body_mask.bytes() + support_seen.bytes();
 #ifdef SOMEVOXEL_PARALLEL_WATER_WORKERS

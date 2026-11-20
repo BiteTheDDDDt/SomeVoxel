@@ -17,6 +17,7 @@ struct SandSweepStats {
     int64_t crossed_faces = 0;
     int64_t contacts = 0;
     int64_t time_us = 0;
+    int64_t collect_us = 0; // Active chunk enumeration, included in time_us.
 };
 
 struct WorldStats {

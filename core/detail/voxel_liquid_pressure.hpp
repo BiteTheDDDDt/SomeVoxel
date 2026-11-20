@@ -258,7 +258,7 @@ private:
             const auto apply_head = [this](int i, int width, int head) {
                 const I3 p = decode(i);
                 if (liquid_head.publish(p, width, LiquidHead(head))) {
-                    awake[chunk_id({p.x / block, p.y / block, p.z / block})] = true;
+                    awake.set_for_cell(p);
                 }
             };
             if (balance) {
@@ -337,7 +337,7 @@ private:
                         }
                     };
                     if (head != previous_water_heads[source_id])
-                        awake[chunk_id({point.x / block, point.y / block, point.z / block})] = true;
+                        awake.set_for_cell(point);
                     if (point.x < nx - 1) visit(source + 1);
                     if (point.x > 0) visit(source - 1);
                     if (point.y < ny - 1) visit(source + slice);

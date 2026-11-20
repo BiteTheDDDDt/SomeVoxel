@@ -48,7 +48,7 @@ private:
         const bool scheduled = material.bulk_hz == bulk_water_hz ? water_tick
             : (uint64_t(tick) * material.bulk_hz) % simulation_hz < material.bulk_hz;
         if (!scheduled) {
-            next_awake[chunk_at(p)] = true;
+            next_awake.set_for_cell(p);
             return;
         }
 

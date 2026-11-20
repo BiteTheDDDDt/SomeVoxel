@@ -74,6 +74,6 @@ private:
             return can_enter(candidate, Water, contact);
         }, nullptr, acceleration);
         commit_particle_path(p, path);
-        next_awake[chunk_id({path.target.x / block, path.target.y / block, path.target.z / block})] = true;
+        next_awake.set_for_cell(path.target);
         return true;
     }

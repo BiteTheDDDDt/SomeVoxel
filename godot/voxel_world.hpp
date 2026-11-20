@@ -141,6 +141,7 @@ public:
         result["crossed_faces"] = stats.crossed_faces;
         result["contacts"] = stats.contacts;
         result["time_us"] = stats.time_us;
+        result["collect_us"] = stats.collect_us;
         return result;
     }
     void set_water_workers(int limit) { world.set_water_workers(limit); }
