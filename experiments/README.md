@@ -50,6 +50,14 @@ Sand starts above a floor and beside an internal wall. A local spring accelerati
 | CUDA APIC/MPM, 6 cm transfer grid, 4 substeps | 3.5 ms | 42 ms |
 | CUDA APIC/MPM, 6 cm transfer grid, 8 substeps | 4.0 ms | 82 ms |
 
+### Isolated production-solver replay
+
+`somevoxel_isolated_sweep_bench` uses the production solver to replay four dry sand and stone fixtures. It compares one serial world containing all four fixtures with four independent worlds stepped by 1, 2 or 4 workers. Each fixture preserves its original coordinates. Timing includes worker synchronization and both physics steps per 1/60-second sample. Loading, launch submission and final occupancy checks are outside the samples.
+
+At 3 cm and 120 Hz, three runs with 179,712 loose grains measured 47.7–50.1 ms P95 in the merged world and 54.1–61.6, 28.0–29.2 and 15.0–17.3 ms for 1, 2 and 4 workers in the partitioned replay. Partitioned results match across worker counts, including the final occupancy checksum, but differ from the merged world. Both conserve mass and report a 1.332 N·s peak contact impulse. The merged world fractures 180 cells and the partitions fracture 176. A diagnostic run raising the global compaction job limit reduced the discrepancy. Sorting packed bodies by position in the same diagnostic matched final sand volume and fracture counts, while occupancy still differed.
+
+Build Release with `SOMEVOXEL_BUILD_EXPERIMENTS=ON`, `SOMEVOXEL_REFINEMENT=6`, `SOMEVOXEL_EXPERIMENTAL_SIMULATION_HZ=120` and `SOMEVOXEL_EXPERIMENTAL_WATER_HZ=90` for this replay. Use `--require-merged-parity` to make the mismatch fail the benchmark. The experiment duplicates the dense grid and can only schedule isolated worlds.
+
 ### CPU tile migration
 
 The persistent mode keeps tile membership across sweeps. After the sorted boundary pass, it removes departing IDs and merges sorted arrivals in affected tiles. Retaining the same ID order preserves the collision order. Two runs at each of 1, 4, 8 and 16 threads produced identical final hashes in both modes for each fixture and particle count. The hash includes grain IDs, occupancy, velocity and subcell travel. The mean time spent on grouping or migration in the dense field test at 8 threads fell from 27.5–29.6 ms to 1.3–1.4 ms per frame.
