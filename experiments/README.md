@@ -58,6 +58,10 @@ At 3 cm and 120 Hz, three runs with 179,712 loose grains measured 47.7–50.1 ms
 
 Build Release with `SOMEVOXEL_BUILD_EXPERIMENTS=ON`, `SOMEVOXEL_REFINEMENT=6`, `SOMEVOXEL_EXPERIMENTAL_SIMULATION_HZ=120` and `SOMEVOXEL_EXPERIMENTAL_WATER_HZ=90` for this replay. Use `--require-merged-parity` to make the mismatch fail the benchmark. The experiment duplicates the dense grid and can only schedule isolated worlds.
 
+Run `somevoxel_isolated_sweep_bench --shared-budget` to use the coordinated replay. The workers gather sand-compaction events, a coordinator applies the production limit once in sweep order, and the replay reconstructs the serial gravel order from packed-body additions and swap-erases. Every worker starts with the same static terrain. Final comparison composes all changes to that terrain over the entire grid and rejects overlapping writes.
+
+In three 3 cm runs, tick 31 generated 817 candidates and admitted 8, 12, 24 and 20 across the four regions. The first rejected contact was (57, 14, 51). Both worker counts matched the merged reference's 180 fractured cells, mass, and peak impulse, with zero differences across 31,352,832 final material cells. For the coordinated replay, P95 per two steps was 42.9–47.0 ms with one worker and 12.6–13.2 ms with four, including admission, worker barriers and gravel ordering. This dry fixture duplicates world storage and has no worker-to-worker dynamic contact or terrain mutation synchronization. The benchmark has its own instrumented core build.
+
 ### CPU tile migration
 
 The persistent mode keeps tile membership across sweeps. After the sorted boundary pass, it removes departing IDs and merges sorted arrivals in affected tiles. Retaining the same ID order preserves the collision order. Two runs at each of 1, 4, 8 and 16 threads produced identical final hashes in both modes for each fixture and particle count. The hash includes grain IDs, occupancy, velocity and subcell travel. The mean time spent on grouping or migration in the dense field test at 8 threads fell from 27.5–29.6 ms to 1.3–1.4 ms per frame.

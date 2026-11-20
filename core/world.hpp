@@ -73,6 +73,29 @@ public:
 
 class World {
     friend class WorldPresentation;
+#ifdef SOMEVOXEL_EXPERIMENTAL_SWEEP_REPLAY
+    friend class SweepReplay;
+    struct SweepCandidate {
+        uint64_t order;
+        uint64_t key;
+        float work;
+        int contact;
+        bool pressure;
+    };
+    std::vector<SweepCandidate> replay_candidates;
+    std::unordered_map<uint64_t, uint64_t> replay_pressure_order;
+    uint64_t replay_order = 0;
+    bool record_replay_candidates = false;
+    bool replay_track_gravel = false;
+    struct ReplayGravelEvent { uint64_t order, identity; bool erase; };
+    uint64_t replay_gravel_order = 0;
+    std::vector<ReplayGravelEvent> replay_gravel_events;
+    std::vector<uint64_t> replay_gravel_ids;
+    std::vector<unsigned> replay_gravel_ranks;
+    void replay_voxel_order(Cell p);
+    void advance_step();
+    void finish_step();
+#endif
 
     using V3 = Vec3;
     using I3 = Cell;
@@ -1009,7 +1032,26 @@ private:
         }
     }
 
+#ifdef SOMEVOXEL_EXPERIMENTAL_SWEEP_REPLAY
+    void replay_gravel_birth() {
+        if (!replay_track_gravel) return;
+        const uint64_t identity = (uint64_t(tick) << 32) | uint32_t(gravel.back().position);
+        replay_gravel_ids.push_back(identity);
+        replay_gravel_ranks.push_back(0);
+        replay_gravel_events.push_back({replay_gravel_order++, identity, false});
+    }
+#endif
+
     void erase_gravel(int id) {
+#ifdef SOMEVOXEL_EXPERIMENTAL_SWEEP_REPLAY
+        if (replay_track_gravel) {
+            replay_gravel_events.push_back({replay_gravel_order++, replay_gravel_ids[id], true});
+            replay_gravel_ids[id] = replay_gravel_ids.back();
+            replay_gravel_ranks[id] = replay_gravel_ranks.back();
+            replay_gravel_ids.pop_back();
+            replay_gravel_ranks.pop_back();
+        }
+#endif
         forget_particle_form(gravel[id].position);
         if (!sand_tile_dirty.empty()) mark_gravel_tile(decode(gravel[id].position));
         if (!airborne_earth_ejecta.empty()) airborne_earth_ejecta.erase(gravel[id].position);
@@ -1566,6 +1608,9 @@ private:
         GravelLiquidMove &liquid = gravel_liquid_scratch;
         for (int id = 0; id < int(gravel.size()); ++id) {
             Grain &grain = gravel[id];
+#ifdef SOMEVOXEL_EXPERIMENTAL_SWEEP_REPLAY
+            if (record_replay_candidates) replay_order = uint64_t(replay_gravel_ranks[id]) << 8;
+#endif
             const I3 from = decode(grain.position);
             if (!gravel_awake(from, grain.extent)) continue;
             FormMotion *form = voxels[grain.position].formed ? &form_motion.at(grain.position) : nullptr;
@@ -1613,6 +1658,9 @@ private:
     }
 
     void update_voxel(I3 p, int index, bool enclosed) {
+#ifdef SOMEVOXEL_EXPERIMENTAL_SWEEP_REPLAY
+        if (record_replay_candidates) replay_voxel_order(p);
+#endif
         const Voxel &voxel = voxels[index];
         const Kind kind = voxel.kind;
         if (voxel.stamp == voxel_stamp || !mobile_at(index)) return;
@@ -2217,6 +2265,9 @@ private:
         mass_units += int(donors.size());
         const int id = int(gravel.size());
         gravel.push_back({cell, cell, tick, extent, momentum / mass_units});
+#ifdef SOMEVOXEL_EXPERIMENTAL_SWEEP_REPLAY
+        replay_gravel_birth();
+#endif
         gravel.back().sand_units = uint16_t(mass_units);
         mark_gravel_tile(p);
         each_cube(cell, extent, [&](int i) {

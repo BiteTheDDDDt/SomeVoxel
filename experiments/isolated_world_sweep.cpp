@@ -9,6 +9,136 @@
 #include <memory>
 #include <string_view>
 
+namespace somevoxel {
+class SweepReplay {
+public:
+    using Worlds = std::array<std::unique_ptr<World>, 4>;
+    using Accepted = std::array<int, 4>;
+    struct Admission {
+        int candidates;
+        Accepted counts;
+        Cell first_rejected;
+    };
+
+    static void gather(World &world) {
+        world.replay_candidates.clear();
+        world.replay_pressure_order.clear();
+        world.replay_order = 0;
+        world.record_replay_candidates = true;
+        world.advance_step();
+        world.integrate_contact_pressure();
+        world.record_replay_candidates = false;
+    }
+
+    static Admission admit(Worlds &worlds) {
+        struct Event {
+            World::SweepCandidate candidate;
+            int domain;
+        };
+        std::vector<Event> events;
+        for (int domain = 0; domain < int(worlds.size()); ++domain)
+            for (const auto &candidate : worlds[domain]->replay_candidates)
+                events.push_back({candidate, domain});
+        std::stable_sort(events.begin(), events.end(), [](const Event &a, const Event &b) {
+            return a.candidate.order < b.candidate.order;
+        });
+        constexpr size_t budget = World::compaction_job_limit;
+        Accepted accepted{};
+        for (size_t i = 0; i < std::min(budget, events.size()); ++i) {
+            const auto &[event, domain] = events[i];
+            auto &world = *worlds[domain];
+            world.compaction_jobs.emplace_back(event.key, event.work);
+            if (event.pressure)
+                world.contact_compression.at(event.key).retry_after = world.tick + std::max(1, World::simulation_hz / 15);
+            ++accepted[domain];
+        }
+        const Cell first_rejected = events.size() > budget ? World::decode(events[budget].candidate.contact) : Cell(-1, -1, -1);
+        return {int(events.size()), accepted, first_rejected};
+    }
+
+    static void finish(World &world) { world.finish_step(); }
+
+    static void enable(World &world) { world.replay_track_gravel = true; }
+
+    static void order_gravel(Worlds &worlds, std::vector<uint64_t> &global_order) {
+        std::vector<World::ReplayGravelEvent> changes;
+        for (auto &world : worlds) {
+            changes.insert(changes.end(), world->replay_gravel_events.begin(), world->replay_gravel_events.end());
+            world->replay_gravel_events.clear();
+        }
+        if (changes.empty()) return;
+        std::stable_sort(changes.begin(), changes.end(), [](auto a, auto b) { return a.order < b.order; });
+        // Recreate the serial gravel vector's swap-erases and appends.
+        // Filtering that order gives each worker its next integration order.
+        for (auto event : changes) {
+            if (event.erase) {
+                const auto item = std::find(global_order.begin(), global_order.end(), event.identity);
+                if (item == global_order.end()) std::abort();
+                *item = global_order.back();
+                global_order.pop_back();
+            } else {
+                global_order.push_back(event.identity);
+            }
+        }
+        std::unordered_map<uint64_t, unsigned> ranks;
+        for (unsigned i = 0; i < global_order.size(); ++i) ranks.emplace(global_order[i], i);
+        for (auto &world : worlds) {
+            std::vector<int> old_ids;
+            for (int id = 0; id < int(world->gravel.size()); ++id) {
+                old_ids.push_back(id);
+                world->replay_gravel_ranks[id] = ranks.at(world->replay_gravel_ids[id]);
+            }
+            std::sort(old_ids.begin(), old_ids.end(), [&](int a, int b) {
+                return world->replay_gravel_ranks[a] < world->replay_gravel_ranks[b];
+            });
+            std::vector<World::Grain> ordered;
+            decltype(world->packed_strain) strains;
+            std::vector<uint64_t> identities;
+            std::vector<unsigned> ordered_ranks;
+            ordered.reserve(old_ids.size());
+            for (int old : old_ids) {
+                const int next = int(ordered.size());
+                const auto &grain = world->gravel[old];
+                ordered.push_back(grain);
+                identities.push_back(world->replay_gravel_ids[old]);
+                ordered_ranks.push_back(world->replay_gravel_ranks[old]);
+                World::each_cube(grain.position, grain.extent, [&](int i) { world->voxels[i].occupant = next; });
+                if (auto strain = world->packed_strain.find(old); strain != world->packed_strain.end())
+                    strains.emplace(next, strain->second);
+            }
+            world->gravel.swap(ordered);
+            world->replay_gravel_ids.swap(identities);
+            world->replay_gravel_ranks.swap(ordered_ranks);
+            world->packed_strain.swap(strains);
+        }
+    }
+
+    static std::vector<uint8_t> terrain(const World &world) {
+        std::vector<uint8_t> kinds;
+        kinds.reserve(world.voxels.size());
+        for (const auto &voxel : world.voxels) kinds.push_back(voxel.kind);
+        return kinds;
+    }
+
+    static int compare(const World &merged, const Worlds &worlds, const std::vector<uint8_t> &terrain) {
+        int differences = 0;
+        for (size_t i = 0; i < terrain.size(); ++i) {
+            const auto baseline = terrain[i];
+            auto composed = baseline;
+            bool overlap = false;
+            for (const auto &world : worlds) {
+                const auto kind = uint8_t(world->voxels[i].kind);
+                if (kind == baseline) continue;
+                if (composed != baseline) overlap = true;
+                composed = kind;
+            }
+            differences += overlap || composed != merged.voxels[i].kind;
+        }
+        return differences;
+    }
+};
+}
+
 namespace {
 using somevoxel::Cell;
 using somevoxel::HeadWorkers;
@@ -116,6 +246,86 @@ Result replay(int workers) {
     return result;
 }
 
+bool shared_budget_replay(int workers) {
+    using somevoxel::SweepReplay;
+    auto merged = std::make_unique<World>();
+    SweepReplay::Worlds worlds;
+    const auto profile = merged->status();
+    const int refinement = int(profile.refinement);
+    if (refinement != 6 || std::abs(profile.step_seconds - 1.f / 120.f) > 1e-6f) {
+        std::cerr << "This parity fixture uses 3 cm cells at 120 Hz.\n";
+        return false;
+    }
+    std::vector<int32_t> terrain_layout;
+    for (const auto &origin : origins)
+        for (const auto &box : boxes) {
+            if (box[6] != World::Stone) continue;
+            for (int i = 0; i < 6; ++i) terrain_layout.push_back((box[i] + origin[i % 3]) * refinement);
+            terrain_layout.push_back(box[6]);
+        }
+    if (!merged->load_boxes(terrain_layout.data(), terrain_layout.size())) return false;
+    const auto terrain_kinds = SweepReplay::terrain(*merged);
+    const auto whole = layout_for(0, domain_count, refinement);
+    if (!merged->load_boxes(whole.data(), whole.size())) return false;
+    merged->set_cast_profile(1.f, 2.f);
+    for (int domain = 0; domain < domain_count; ++domain) {
+        worlds[domain] = std::make_unique<World>();
+        auto layout = terrain_layout;
+        const auto contents = layout_for(domain, domain + 1, refinement);
+        for (size_t i = 0; i < contents.size(); i += 7)
+            if (contents[i + 6] == World::Sand)
+                layout.insert(layout.end(), contents.begin() + i, contents.begin() + i + 7);
+        if (!worlds[domain]->load_boxes(layout.data(), layout.size())) return false;
+        worlds[domain]->set_cast_profile(1.f, 2.f);
+        SweepReplay::enable(*worlds[domain]);
+    }
+    HeadWorkers pool(workers);
+    std::vector<uint64_t> gravel_order;
+    int first_volume_difference = 0;
+    std::vector<double> samples;
+    SweepReplay::Admission launch_admission{};
+    bool valid = true;
+    for (int tick = 1; tick <= 120; ++tick) {
+        if (tick == 31)
+            for (int domain = 0; domain < domain_count; ++domain)
+                valid = (launch(*merged, domain) == launch(*worlds[domain], domain)) && valid;
+        merged->step();
+        const auto start = Clock::now();
+        pool.run([&](int worker) {
+            for (int domain = worker; domain < domain_count; domain += pool.count) SweepReplay::gather(*worlds[domain]);
+        });
+        const auto admission = SweepReplay::admit(worlds);
+        pool.run([&](int worker) {
+            for (int domain = worker; domain < domain_count; domain += pool.count) SweepReplay::finish(*worlds[domain]);
+        });
+        SweepReplay::order_gravel(worlds, gravel_order);
+        samples.push_back(std::chrono::duration<double, std::milli>(Clock::now() - start).count());
+        if (tick == 31) launch_admission = admission;
+        int64_t volume = 0;
+        for (const auto &world : worlds) volume += world->status().sand_volume;
+        if (!first_volume_difference && volume != merged->status().sand_volume) first_volume_difference = tick;
+    }
+    Result expected, actual;
+    collect(expected, *merged);
+    for (const auto &world : worlds) collect(actual, *world);
+    const int differences = SweepReplay::compare(*merged, worlds, terrain_kinds);
+    std::vector<double> frames;
+    for (size_t i = 8; i < samples.size(); i += 2) frames.push_back(samples[i] + samples[i + 1]);
+    std::sort(frames.begin(), frames.end());
+    const auto &[candidates, accepted, rejected] = launch_admission;
+    std::cout << "workers=" << workers << " tick31_candidates=" << candidates << " admissions=";
+    for (int n : accepted) std::cout << ' ' << n;
+    std::cout << " first_rejected=" << rejected.x << ',' << rejected.y << ',' << rejected.z
+        << " first_volume_difference=" << first_volume_difference
+        << " fractures=" << expected.fractures << '/' << actual.fractures
+        << " grid_cells=" << terrain_kinds.size() << " full_grid_differences=" << differences << " p95_ms=" << frames[size_t(std::ceil(frames.size() * .95)) - 1]
+        << std::endl;
+    return valid && candidates == 817 && accepted == SweepReplay::Accepted{8, 12, 24, 20} &&
+        rejected == Cell(57, 14, 51) && first_volume_difference == 0 &&
+        expected.mass == actual.mass && expected.impulse == actual.impulse &&
+        expected.fractures == 180 && expected.fractures == actual.fractures && differences == 0;
+}
+
 void report(int workers, const Result &result) {
     std::cout << "workers=" << workers << " p95_ms=" << result.p95_ms << " sand_mass=" << result.mass
         << " sand_volume=" << result.volume << " launched=" << result.launched
@@ -131,6 +341,11 @@ bool same_state(const Result &a, const Result &b) {
 }
 
 int main(int argc, char **argv) {
+    if (argc == 2 && std::string_view(argv[1]) == "--shared-budget") {
+        const bool one = shared_budget_replay(1);
+        const bool four = shared_budget_replay(4);
+        return one && four ? 0 : 1;
+    }
     const bool require_merged_parity = argc == 2 && std::string_view(argv[1]) == "--require-merged-parity";
     if (argc > 1 && !require_merged_parity) return 2;
     std::cout << std::fixed << std::setprecision(6);

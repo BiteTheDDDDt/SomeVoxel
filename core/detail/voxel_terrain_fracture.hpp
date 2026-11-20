@@ -16,6 +16,7 @@ private:
     };
 
     static constexpr size_t terrain_strain_limit = 8192;
+    static constexpr size_t compaction_job_limit = 64;
     static constexpr float sand_yield_pressure = 14000.f;
     std::unordered_map<int, TerrainStrain> terrain_strain;
     std::vector<int> terrain_fracture_jobs;
@@ -123,7 +124,14 @@ private:
     }
 
     void record_compaction_load(I3 contact, MaterialLoad load) {
-        if (load.work < sand_compaction_work(2, 2) || compaction_jobs.size() >= 64) return;
+        if (load.work < sand_compaction_work(2, 2)) return;
+#ifdef SOMEVOXEL_EXPERIMENTAL_SWEEP_REPLAY
+        if (record_replay_candidates) {
+            replay_candidates.push_back({replay_order++, packing_key(contact, 2), load.work, flat(contact), false});
+            return;
+        }
+#endif
+        if (compaction_jobs.size() >= compaction_job_limit) return;
         compaction_jobs.emplace_back(packing_key(contact, 2), load.work);
     }
 
@@ -135,7 +143,12 @@ private:
             entry = contact_compression.emplace(id, CompressionHistory{}).first;
         }
         auto &history = entry->second;
-        if (history.pressure == 0.f) sampled_compression_sites.push_back(id);
+        if (history.pressure == 0.f) {
+            sampled_compression_sites.push_back(id);
+#ifdef SOMEVOXEL_EXPERIMENTAL_SWEEP_REPLAY
+            if (record_replay_candidates) replay_pressure_order.emplace(id, replay_order++);
+#endif
+        }
         history.pressure = std::max(history.pressure, pressure);
     }
 
@@ -172,7 +185,15 @@ private:
         const float duration = (sample_gap <= sample_tolerance && history.work > 0.f ? sample_gap : 1u) * dt;
         history.work = std::min(porous_threshold,
             history.work + (pressure - sand_yield_pressure) * closure_volume * max_closure_rate * duration);
-        if (history.work >= threshold && tick >= history.retry_after && compaction_jobs.size() < 64) {
+#ifdef SOMEVOXEL_EXPERIMENTAL_SWEEP_REPLAY
+        if (record_replay_candidates) {
+            if (history.work >= threshold && tick >= history.retry_after)
+                replay_candidates.push_back({(uint64_t(1) << 56) | replay_pressure_order.at(id), id,
+                    history.work, int(id >> 4), true});
+            return;
+        }
+#endif
+        if (history.work >= threshold && tick >= history.retry_after && compaction_jobs.size() < compaction_job_limit) {
             compaction_jobs.emplace_back(id, history.work);
             history.retry_after = tick + std::max(1, simulation_hz / 15);
         }
@@ -413,6 +434,9 @@ private:
             while (i < compaction_jobs.size() && compaction_jobs[i].first == anchor) work += compaction_jobs[i++].second;
             const int extent = int(anchor & 15u);
             const I3 site = decode(int(anchor >> 4));
+#ifdef SOMEVOXEL_EXPERIMENTAL_SWEEP_REPLAY
+            if (replay_track_gravel) replay_gravel_order = (uint64_t(1) << 60) | (anchor << 12);
+#endif
             if (pack_loaded_region(site, extent, {work, {}}))
                 contact_compression.erase(anchor);
         }
@@ -518,6 +542,9 @@ private:
                 const int child = origin + half * offset;
                 const int child_id = int(gravel.size());
                 gravel.push_back({child, child, tick, half, grain.velocity});
+#ifdef SOMEVOXEL_EXPERIMENTAL_SWEEP_REPLAY
+                replay_gravel_birth();
+#endif
                 if (grain.sand_units) gravel.back().sand_units = uint16_t(mass_units / 8);
                 if (!sand_tile_dirty.empty()) mark_gravel_tile(decode(child));
                 each_cube(child, half, [&](int i) { voxels[i] = {Gravel, voxel_stamp, child_id}; });
@@ -536,6 +563,9 @@ private:
             std::sort(packed_fracture_jobs.rbegin(), packed_fracture_jobs.rend());
             std::vector<int> overflow;
             for (int id : packed_fracture_jobs) {
+#ifdef SOMEVOXEL_EXPERIMENTAL_SWEEP_REPLAY
+                if (replay_track_gravel) replay_gravel_order = uint64_t(~replay_gravel_ranks[id]) << 12;
+#endif
                 if (split_packed_body(id, overflow)) ++fractured;
                 else packed_strain.at(id).queued = false;
             }

@@ -396,7 +396,27 @@ std::optional<PackedParticleState> World::packed_particle_state(int64_t handle) 
     return PackedParticleState{center, previous, grain.velocity, grain.extent};
 }
 
+#ifdef SOMEVOXEL_EXPERIMENTAL_SWEEP_REPLAY
 void World::step() {
+    advance_step();
+    finish_step();
+}
+
+void World::replay_voxel_order(Cell p) {
+    uint32_t phase = tick;
+#ifdef SOMEVOXEL_EXPERIMENTAL_WATER_SWEEP_PHASE
+    if (water_tick) phase = uint32_t(uint64_t(tick) * bulk_water_hz / simulation_hz);
+#endif
+    const int x = phase & 1u ? nx - p.x - 1 : p.x;
+    const int z = phase & 2u ? nz - p.z - 1 : p.z;
+    // Match the scan's Y, chunk Z/X, then voxel Z/X order within each row.
+    const uint64_t visit = ((((p.y * bz + z / block) * bx + x / block) * block + z % block) * block + x % block);
+    replay_order = (uint64_t(1) << 48) | (visit << 8);
+}
+void World::advance_step() {
+#else
+void World::step() {
+#endif
     sand_sweep = {};
     ++tick;
     // This tag only distinguishes changes within the current step. Clear
@@ -540,6 +560,11 @@ void World::step() {
     }
     awake.swap(next_awake);
     finish_packed_fractures();
+#ifdef SOMEVOXEL_EXPERIMENTAL_SWEEP_REPLAY
+}
+
+void World::finish_step() {
+#endif
     finish_contact_compaction();
     finish_terrain_fractures();
     step_earth_wave();
