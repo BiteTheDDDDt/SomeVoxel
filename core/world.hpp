@@ -1375,14 +1375,16 @@ private:
     // Inside a solid volume of loose sand, all three attempted faces are
     // blocked for this entire grain update. Normal contact changes only its
     // own axis. Apply those contacts directly in the existing grain order.
-    bool step_enclosed_sand(Grain &grain, I3 p, V3 acceleration, bool attracted) {
-        if (p.x == 0 || p.x == nx - 1 || p.y == 0 || p.y == ny - 1 || p.z == 0 || p.z == nz - 1)
-            return false;
+    bool step_enclosed_sand(Grain &grain, I3 p, V3 acceleration, bool attracted, bool enclosed) {
         const int i = grain.position;
-        if (voxels[i - 1].kind != Sand || voxels[i + 1].kind != Sand ||
-                voxels[i - nx].kind != Sand || voxels[i + nx].kind != Sand ||
-                voxels[i - slice].kind != Sand || voxels[i + slice].kind != Sand)
-            return false;
+        if (!enclosed) {
+            if (p.x == 0 || p.x == nx - 1 || p.y == 0 || p.y == ny - 1 || p.z == 0 || p.z == nz - 1)
+                return false;
+            if (voxels[i - 1].kind != Sand || voxels[i + 1].kind != Sand ||
+                    voxels[i - nx].kind != Sand || voxels[i + nx].kind != Sand ||
+                    voxels[i - slice].kind != Sand || voxels[i + slice].kind != Sand)
+                return false;
+        }
 
         if (!attracted && grain.velocity.y <= 0.f && acceleration.y <= 0.f) {
             grain.travel.y = 0.f;
@@ -1466,7 +1468,8 @@ private:
     // until a face crossing can be committed to the shared occupancy grid.
     template <typename Fits>
     ParticlePath advance_particle(Grain &grain, I3 from, Kind kind, Fits fits,
-            FormMotion *form = nullptr, V3 external_acceleration = V3(), GravelLiquidMove *liquid = nullptr) {
+            FormMotion *form = nullptr, V3 external_acceleration = V3(), GravelLiquidMove *liquid = nullptr,
+            bool enclosed = false) {
         const I3 down(0, -1, 0);
         const GranularMaterial material = granular_material(kind);
         V3 acceleration = V3(0, -gravity, 0) + external_acceleration;
@@ -1475,7 +1478,7 @@ private:
         acceleration += wind_drive(grain, from, kind);
         if (kind != Sand || !attracted)
             sample_bearing_contact(grain, from, kind, acceleration, fits);
-        if (kind == Sand && airborne_earth_ejecta.empty() && step_enclosed_sand(grain, from, acceleration, attracted))
+        if (kind == Sand && airborne_earth_ejecta.empty() && step_enclosed_sand(grain, from, acceleration, attracted, enclosed))
             return {from, from};
         I3 slope;
         int support = -1;
@@ -1572,7 +1575,7 @@ private:
         commit_particle_path(p, path);
     }
 
-    void update_voxel(I3 p, int index) {
+    void update_voxel(I3 p, int index, bool enclosed) {
         const Voxel &voxel = voxels[index];
         const Kind kind = voxel.kind;
         if (voxel.stamp == voxel_stamp || !mobile_at(index)) return;
@@ -1582,7 +1585,7 @@ private:
             Grain &grain = kind == Water ? liquid_particle(index) : grains[voxel.occupant];
             const ParticlePath path = advance_particle(grain, p, kind, [&](I3 candidate, int *contact = nullptr) {
                 return can_enter(candidate, kind, contact);
-            }, &form);
+            }, &form, V3(), nullptr, enclosed);
             commit_particle_path(p, path);
             return;
         }
@@ -1592,7 +1595,7 @@ private:
             if (profile_sand_sweep && kind == Sand) ++sand_sweep.integrated;
             const ParticlePath path = advance_particle(grain, p, kind, [&](I3 candidate, int *contact = nullptr) {
                 return can_enter(candidate, kind, contact);
-            });
+            }, nullptr, V3(), nullptr, enclosed);
             commit_particle_path(p, path);
             return;
         }

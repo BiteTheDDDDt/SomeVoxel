@@ -454,6 +454,7 @@ void World::step() {
                     if (profile_sand_sweep) sand_sweep.empty_rows += block;
                     continue;
                 }
+                const bool full_sand_candidate = sand_chunk_counts[chunk_index] == block * block * block;
                 for (int z = 0; z < block; ++z) {
                     const I3 row(chunk.x * block, y, chunk.z * block + (reverse_z ? block - 1 - z : z));
                     const int row_start = flat(row);
@@ -481,10 +482,29 @@ void World::step() {
                             continue;
                         }
                     }
+                    const int y_lane = y & (block - 1);
+                    if (full_sand_candidate && z > 0 && z < block - 1 && y_lane > 0 && y_lane < block - 1) {
+                        const int edge = reverse_x ? block - 1 : 0;
+                        if (mask & (1u << edge)) {
+                            mask &= ~(1u << edge);
+                            update_voxel({row.x + edge, row.y, row.z}, row_start + edge, false);
+                        }
+                        // The leading edge can open a hole. Once confirmed
+                        // full, no interior grain can leave before the far edge.
+                        if (sand_chunk_counts[chunk_index] == block * block * block) {
+                            constexpr unsigned edges = 1u | (1u << (block - 1));
+                            for (unsigned inside = mask & ~edges; inside;) {
+                                const int x = next_row_cell(inside, reverse_x);
+                                inside &= ~(1u << x);
+                                update_voxel({row.x + x, row.y, row.z}, row_start + x, true);
+                            }
+                            mask &= edges;
+                        }
+                    }
                     while (mask) {
                         const int x = next_row_cell(mask, reverse_x);
                         mask &= ~(1u << x);
-                        update_voxel({row.x + x, row.y, row.z}, row_start + x);
+                        update_voxel({row.x + x, row.y, row.z}, row_start + x, false);
                     }
                 }
             }
