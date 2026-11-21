@@ -39,6 +39,9 @@ private:
     };
     std::unordered_map<PackingKey, CompressionHistory> contact_compression;
     std::vector<PackingKey> sampled_compression_sites;
+#if SOMEVOXEL_PARALLEL_SAND_WORKERS > 1
+    std::array<std::vector<std::pair<I3, float>>, SOMEVOXEL_PARALLEL_SAND_WORKERS> sand_pressure_bands;
+#endif
     std::array<int, Char + 1> terrain_contact_breaks{};
     std::array<TerrainImpactPeak, Char + 1> terrain_impact_peaks{};
 
@@ -243,7 +246,7 @@ private:
         return run;
     }
 
-    void sample_field_bearing_contact(I3 from, float coverage) {
+    float field_bearing_pressure(I3 from, float coverage) const {
         constexpr float bearing_depth = 0.18f;
         constexpr int bearing_cells = int(bearing_depth / scale + 0.5f);
         const V3 local = sand_elastic_acceleration(from);
@@ -265,7 +268,7 @@ private:
             const float pressure = sand_density * bearing_depth * coverage * std::min(opposing[0], opposing[1]);
             best = std::max(best, pressure);
         }
-        if (best > sand_yield_pressure) record_contact_pressure(from, best);
+        return best;
     }
 
     template <typename Fits>
@@ -332,9 +335,15 @@ private:
         // every elastic force source. Dispatch only locates driven cells.
         const float span = 0.32f * cast_radius_scale;
         const float inverse_span_squared = 1.f / (span * span);
-        const auto sample = [&](I3 p, V3 focus) {
+        const auto sample = [&](I3 p, V3 focus, auto &emit) {
             const float coverage = 1.f - center(p).distance_squared_to(focus) * inverse_span_squared;
-            if (coverage > 0.f) sample_field_bearing_contact(p, coverage);
+            if (coverage > 0.f) {
+                const float pressure = field_bearing_pressure(p, coverage);
+                if (pressure > sand_yield_pressure) emit(p, pressure);
+            }
+        };
+        const auto record = [&](I3 p, float pressure) {
+            record_contact_pressure(p, pressure);
         };
         if (pulling) {
             const V3 reach(span, span, span);
@@ -342,14 +351,44 @@ private:
             const I3 hi = grid(field + reach);
             const int phase = int(tick & 7u);
             const auto first = [](int start, int parity) { return start + ((start ^ parity) & 1); };
-            for (int y = first(std::max(0, lo.y), phase); y <= std::min(ny - 1, hi.y); y += 2)
-                for (int z = first(std::max(0, lo.z), phase >> 2); z <= std::min(nz - 1, hi.z); z += 2)
-                    for (int x = first(std::max(0, lo.x), phase >> 1); x <= std::min(nx - 1, hi.x); x += 2) {
-                        const I3 p(x, y, z);
-                        const Voxel &voxel = voxels[flat(p)];
-                        if (voxel.kind != Sand || voxel.formed) continue;
-                        sample(p, field);
-                    }
+            const I3 begin(first(std::max(0, lo.x), phase >> 1), first(std::max(0, lo.y), phase),
+                first(std::max(0, lo.z), phase >> 2));
+            const I3 end(std::min(nx - 1, hi.x), std::min(ny - 1, hi.y), std::min(nz - 1, hi.z));
+            const auto scan = [&](int first_y, int past_y, auto &emit) {
+                for (int y = first_y; y < past_y; y += 2)
+                    for (int z = begin.z; z <= end.z; z += 2)
+                        for (int x = begin.x; x <= end.x; x += 2) {
+                            const I3 p(x, y, z);
+                            const Voxel &voxel = voxels[flat(p)];
+                            if (voxel.kind == Sand && !voxel.formed) sample(p, field, emit);
+                        }
+            };
+#if SOMEVOXEL_PARALLEL_SAND_WORKERS > 1
+            const auto sample_count = [](int from, int to) { return from > to ? 0 : (to - from) / 2 + 1; };
+            const int layers = sample_count(begin.y, end.y);
+            const size_t per_layer = size_t(sample_count(begin.x, end.x)) * sample_count(begin.z, end.z);
+            constexpr size_t minimum_parallel_samples = 4096;
+            const size_t possible_samples = std::min(grains.size(), per_layer * layers);
+            if (layers >= 2 && possible_samples >= minimum_parallel_samples && sand_worker_pool().count > 1) {
+                auto &pool = sand_worker_pool();
+                const auto layer = [&](int worker) { return layers * worker / pool.count; };
+                // Preallocate on the caller. Each band emits at most once per sampled grain.
+                for (int worker = 0; worker < pool.count; ++worker) {
+                    auto &band = sand_pressure_bands[worker];
+                    band.clear();
+                    band.reserve(std::min(grains.size(), per_layer * (layer(worker + 1) - layer(worker))));
+                }
+                pool.run([&](int worker) {
+                    auto &band = sand_pressure_bands[worker];
+                    const auto collect = [&](I3 p, float pressure) { band.emplace_back(p, pressure); };
+                    scan(begin.y + 2 * layer(worker), begin.y + 2 * layer(worker + 1), collect);
+                });
+                // Preserve the serial admission order at the bounded pressure-history table.
+                for (int worker = 0; worker < pool.count; ++worker)
+                    for (const auto &[p, pressure] : sand_pressure_bands[worker]) record(p, pressure);
+            } else
+#endif
+                scan(begin.y, end.y + 1, record);
         }
         if (particle_form.material != Sand) return;
         std::vector<int> held_samples;
@@ -358,7 +397,7 @@ private:
             if (sample_sand_pressure_at(decode(index))) held_samples.push_back(index);
         }
         std::sort(held_samples.begin(), held_samples.end());
-        for (int index : held_samples) sample(decode(index), particle_form.point);
+        for (int index : held_samples) sample(decode(index), particle_form.point, record);
     }
 
     float pressure_face_coverage(I3 origin, int extent, int axis) const {

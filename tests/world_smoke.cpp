@@ -1,4 +1,5 @@
 #include "core/world.hpp"
+#include <cmath>
 #include <iostream>
 
 static bool water_head_selection() {
@@ -254,7 +255,8 @@ static bool packed_sand_forms(somevoxel::World &world) {
         62, 4, 60, 63, 6, 61, World::Sand,
     };
     if (!world.load_boxes(pile, std::size(pile))) return false;
-    const Vec3 center = Vec3(61, 5, 61) * world.status().cell_size;
+    const float cell_size = world.status().cell_size;
+    const Vec3 center = Vec3(61, 5, 61) * cell_size;
     world.set_particle_form(center, {1, 0, 0}, World::Sand, 1, 1.4f, 2.f);
     world.step();
     const auto before = world.particle_form_throw();
@@ -264,7 +266,10 @@ static bool packed_sand_forms(somevoxel::World &world) {
     if (world.status().packed_sand_blocks != 1) return false;
     const auto packed = world.particle_form_throw();
     if (packed.count != 1 || packed.blocks != 1 || std::abs(packed.mass - before.mass) > 0.0001f) return false;
-    if (world.impact(center, 0.14f, 1.f) != 1) return false;
+    // Impact work scales with cell_size³ * strength² and fracture work with cell_size².
+    // Preserve their ratio for the same packed body as in the 4.5 cm fixture.
+    const float impact_strength = std::sqrt(0.045f / cell_size);
+    if (world.impact(center, 0.14f, impact_strength) != 1) return false;
     const auto loose = world.particle_form_throw();
     return loose.count == 10 && loose.blocks == 0 && std::abs(loose.mass - before.mass) <= 0.0001f;
 }

@@ -245,6 +245,7 @@ bool World::load_boxes(const int32_t *layout, size_t length) {
     std::fill(bulk_water_rows.begin(), bulk_water_rows.end(), 0);
     std::fill(water_chunk_counts.begin(), water_chunk_counts.end(), 0);
     std::fill(sand_chunk_counts.begin(), sand_chunk_counts.end(), 0);
+    sand_rows.clear();
     std::fill(settled_sand_chunks.begin(), settled_sand_chunks.end(), 0);
     liquid_head.clear();
     grains.clear();
@@ -396,6 +397,60 @@ std::optional<PackedParticleState> World::packed_particle_state(int64_t handle) 
     return PackedParticleState{center, previous, grain.velocity, grain.extent};
 }
 
+#if SOMEVOXEL_PARALLEL_SAND_WORKERS > 1
+HeadWorkers &World::sand_worker_pool() {
+#if defined(SOMEVOXEL_PARALLEL_WATER_WORKERS) && SOMEVOXEL_PARALLEL_SAND_WORKERS == SOMEVOXEL_PARALLEL_WATER_WORKERS
+    if (requested_water_workers == -1) return water_solver().worker_pool();
+#endif
+    if (!sand_workers) {
+        const unsigned detected = std::thread::hardware_concurrency();
+        const int count = detected ? std::min<unsigned>(SOMEVOXEL_PARALLEL_SAND_WORKERS, detected)
+                                   : SOMEVOXEL_PARALLEL_SAND_WORKERS;
+        sand_workers = std::make_unique<HeadWorkers>(count);
+    }
+    return *sand_workers;
+}
+
+void World::prepare_sand_pull_slab(const I3 *chunks, int count, int *offsets) {
+    // A moved grain is stamped out of the sweep. For every remaining grain the
+    // spatial coefficients stay valid, even when a prior contact changes its velocity.
+    constexpr int cells = block * block * block;
+    const float reach = granular_material(Sand).attraction_range * cast_radius_scale + 2.f * scale;
+    sand_pull_chunks.clear();
+    int grains_in_slab = 0;
+    for (int entry = 0; entry < count; ++entry) {
+        const int population = sand_chunk_counts[chunk_id(chunks[entry])];
+        offsets[entry] = -1;
+        if (population < cells / 8 || chunk_distance_squared(chunks[entry], field) > reach * reach) continue;
+        grains_in_slab += population;
+        sand_pull_chunks.push_back(entry);
+    }
+    if (grains_in_slab < 4096) return;
+    sand_pull_slab.resize(sand_pull_chunks.size() * cells);
+    auto &pool = sand_worker_pool();
+    pool.run([&](int worker) {
+        for (size_t task = worker; task < sand_pull_chunks.size(); task += pool.count) {
+            const int entry = sand_pull_chunks[task];
+            const I3 start = chunks[entry] * block;
+            const int offset = int(task) * cells;
+            offsets[entry] = offset;
+            for (int y = 0; y < std::min(block, ny - start.y); ++y) {
+                for (int z = 0; z < block; ++z) {
+                    const int base = flat({start.x, start.y + y, start.z + z});
+                    const int row = base / block;
+                    for (unsigned bits = sand_rows[row]; bits; bits &= bits - 1) {
+                        const int x = next_row_cell(bits, false);
+                        const Grain &grain = grains[voxels[base + x].occupant];
+                        sand_pull_slab[offset + (y * block + z) * block + x] =
+                            free_particle_pull(grain, {start.x + x, start.y + y, start.z + z}, Sand, false);
+                    }
+                }
+            }
+        }
+    });
+}
+#endif
+
 #ifdef SOMEVOXEL_EXPERIMENTAL_SWEEP_REPLAY
 void World::step() {
     advance_step();
@@ -460,6 +515,10 @@ void World::step() {
     // Reuse the horizontal worklist for all eight voxel rows of a slab.
     // The traversal within each row stays bottom-up and alternates X/Z.
     std::array<I3, bx * bz> slab_chunks;
+#if SOMEVOXEL_PARALLEL_SAND_WORKERS > 1
+    std::array<int, bx * bz> field_offsets;
+    const bool prepare_field = pulling && grains.size() >= 16384;
+#endif
     const bool allow_settled_sand = !winding && airborne_earth_ejecta.empty();
     std::chrono::steady_clock::duration collect_time{};
     for (int cy = 0; cy < by; ++cy) {
@@ -481,6 +540,9 @@ void World::step() {
         if (profile_sand_sweep) collect_time += std::chrono::steady_clock::now() - collect_start;
         if (allow_settled_sand)
             for (int entry = 0; entry < count; ++entry) certify_settled_sand(slab_chunks[entry]);
+#if SOMEVOXEL_PARALLEL_SAND_WORKERS > 1
+        if (prepare_field) prepare_sand_pull_slab(slab_chunks.data(), count, field_offsets.data());
+#endif
         active_count += count;
         for (int y = cy * block; y < std::min(ny, (cy + 1) * block); ++y) {
             for (int entry = 0; entry < count; ++entry) {
@@ -497,7 +559,6 @@ void World::step() {
                     if (profile_sand_sweep) sand_sweep.empty_rows += block;
                     continue;
                 }
-                const bool full_sand_candidate = sand_chunk_counts[chunk_index] == block * block * block;
                 for (int z = 0; z < block; ++z) {
                     const I3 row(chunk.x * block, y, chunk.z * block + (reverse_z ? block - 1 - z : z));
                     const int row_start = flat(row);
@@ -525,29 +586,24 @@ void World::step() {
                             continue;
                         }
                     }
-                    const int y_lane = y & (block - 1);
-                    if (full_sand_candidate && z > 0 && z < block - 1 && y_lane > 0 && y_lane < block - 1) {
-                        const int edge = reverse_x ? block - 1 : 0;
-                        if (mask & (1u << edge)) {
-                            mask &= ~(1u << edge);
-                            update_voxel({row.x + edge, row.y, row.z}, row_start + edge, false);
-                        }
-                        // The leading edge can open a hole. Once confirmed
-                        // full, no interior grain can leave before the far edge.
-                        if (sand_chunk_counts[chunk_index] == block * block * block) {
-                            constexpr unsigned edges = 1u | (1u << (block - 1));
-                            for (unsigned inside = mask & ~edges; inside;) {
-                                const int x = next_row_cell(inside, reverse_x);
-                                inside &= ~(1u << x);
-                                update_voxel({row.x + x, row.y, row.z}, row_start + x, true);
-                            }
-                            mask &= edges;
-                        }
+                    const SandPull *field_row = nullptr;
+#if SOMEVOXEL_PARALLEL_SAND_WORKERS > 1
+                    if (prepare_field && field_offsets[entry] >= 0) {
+                        const int local_row = (y % block) * block + row.z % block;
+                        field_row = sand_pull_slab.data() + field_offsets[entry] + local_row * block;
                     }
+#endif
                     while (mask) {
-                        const int x = next_row_cell(mask, reverse_x);
-                        mask &= ~(1u << x);
-                        update_voxel({row.x + x, row.y, row.z}, row_start + x, false);
+                        const uint32_t revision = sand_occupancy_revision;
+                        const unsigned enclosed = enclosed_sand_row(row, row_id);
+                        // Any earlier move can change a face in the remaining lanes.
+                        do {
+                            const int x = next_row_cell(mask, reverse_x);
+                            const unsigned bit = 1u << x;
+                            mask &= ~bit;
+                            update_voxel({row.x + x, row.y, row.z}, row_start + x, (enclosed & bit) != 0,
+                                field_row ? field_row + x : nullptr);
+                        } while (mask && revision == sand_occupancy_revision);
                     }
                 }
             }

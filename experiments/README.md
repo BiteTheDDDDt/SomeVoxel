@@ -62,6 +62,26 @@ Run `somevoxel_isolated_sweep_bench --shared-budget` to use the coordinated repl
 
 In three 3 cm runs, tick 31 generated 817 candidates and admitted 8, 12, 24 and 20 across the four regions. The first rejected contact was (57, 14, 51). Both worker counts matched the merged reference's 180 fractured cells, mass, and peak impulse, with zero differences across 31,352,832 final material cells. For the coordinated replay, P95 per two steps was 42.9–47.0 ms with one worker and 12.6–13.2 ms with four, including admission, worker barriers and gravel ordering. This dry fixture duplicates world storage and has no worker-to-worker dynamic contact or terrain mutation synchronization. The benchmark has its own instrumented core build.
 
+### Single-world sand replay
+
+`somevoxel_sand_world_bench` runs the two mixed-material layouts and sand field trajectory from SomeAvatar's fixed-camera benchmark at commit `b9ecd51`. Each layout has one connected sand and gravel mound, an open reservoir and stone walls. Each line of [the fixture](fixtures/sand_world_3cm.txt) is a map ID (1 or 2) and the seven integers passed to the production `World::load_boxes`. Use Release, refinement 6, 120 Hz simulation, 90 Hz water and `SOMEVOXEL_EXPERIMENTAL_WATER_SWEEP_PHASE=ON` for both builds. Keep water workers identical.
+
+```sh
+somevoxel_sand_world_bench experiments/fixtures/sand_world_3cm.txt check
+somevoxel_sand_world_bench experiments/fixtures/sand_world_3cm.txt timing
+```
+
+Compare the complete `check` output across builds with `SOMEVOXEL_PARALLEL_SAND_WORKERS=1` and `=4`. It reports a full-grid material hash, sand and water inventories, particle movement counts, fractures and peak stone-contact impulse at ticks 2, 70, 240, 360 and 480 in each map. The independent `timing` run reports the wall time of two `World::step()` calls per sample, after the first 45 batches of each map. The default is 240 batches per map. Append a shorter batch count for a smoke check.
+
+Two alternating Release runs per build on a Ryzen 9 8945HX measured the following ranges. The baseline was `d185842`, water used four workers, and each map contributed 195 samples per run.
+
+| Map | Baseline P50 / P95 (ms) | 1 sand worker P50 / P95 (ms) | 4 sand workers P50 / P95 (ms) |
+| --- | ---: | ---: | ---: |
+| 1 | 38.4–44.8 / 53.2–57.1 | 35.5–37.3 / 51.6–70.4 | 33.5–35.5 / 44.8–47.5 |
+| 2 | 36.3–40.9 / 50.8–53.0 | 33.9–38.1 / 47.2–53.4 | 33.3–36.5 / 43.6–55.1 |
+
+The four-worker build lowered the average of the two run medians by 17% in map 1 and 9% in map 2. Map 2's P95 varied across runs. All ten checkpoints agreed with the baseline in both worker configurations.
+
 ### CPU tile migration
 
 The persistent mode keeps tile membership across sweeps. After the sorted boundary pass, it removes departing IDs and merges sorted arrivals in affected tiles. Retaining the same ID order preserves the collision order. Two runs at each of 1, 4, 8 and 16 threads produced identical final hashes in both modes for each fixture and particle count. The hash includes grain IDs, occupancy, velocity and subcell travel. The mean time spent on grouping or migration in the dense field test at 8 threads fell from 27.5–29.6 ms to 1.3–1.4 ms per frame.
