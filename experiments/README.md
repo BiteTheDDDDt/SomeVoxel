@@ -75,12 +75,14 @@ Compare the complete `check` output across builds with `SOMEVOXEL_PARALLEL_SAND_
 
 Two alternating Release runs per build on a Ryzen 9 8945HX measured the following ranges. The baseline was `d185842`, water used four workers, and each map contributed 195 samples per run.
 
-| Map | Baseline P50 / P95 (ms) | 1 sand worker P50 / P95 (ms) | 4 sand workers P50 / P95 (ms) |
-| --- | ---: | ---: | ---: |
-| 1 | 38.4–44.8 / 53.2–57.1 | 35.5–37.3 / 51.6–70.4 | 33.5–35.5 / 44.8–47.5 |
-| 2 | 36.3–40.9 / 50.8–53.0 | 33.9–38.1 / 47.2–53.4 | 33.3–36.5 / 43.6–55.1 |
+| Map | Baseline P50 / P95 (ms) | 4 sand workers P50 / P95 (ms) |
+| --- | ---: | ---: |
+| 1 | 33.4–35.2 / 42.6–51.3 | 28.9–33.3 / 41.0–56.5 |
+| 2 | 30.5–32.2 / 44.1–44.7 | 29.5–32.1 / 40.7–51.4 |
 
-The four-worker build lowered the average of the two run medians by 17% in map 1 and 9% in map 2. Map 2's P95 varied across runs. All ten checkpoints agreed with the baseline in both worker configurations.
+The four-worker build lowered the average of the two run medians by 9% in map 1 and 2% in map 2. P95 varied across runs in both maps. All ten checkpoints agreed with the baseline.
+
+Vulkan Forward+ integration runs used SomeAvatar `b9ecd51`, the same two maps, 1280 × 800, the default 3 cm water mesh settings and an RTX 5070 Ti Laptop GPU. Across two runs per build, whole-frame P50 was 44.6–47.4 ms on `d185842` and 45.4–47.1 ms with the parallel field batch. P95 was 56.3–60.3 ms and 61.3–61.7 ms respectively. Both builds matched the final material counts and drew the same median number of grains.
 
 ### CPU tile migration
 

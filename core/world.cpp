@@ -411,43 +411,61 @@ HeadWorkers &World::sand_worker_pool() {
     return *sand_workers;
 }
 
-void World::prepare_sand_pull_slab(const I3 *chunks, int count, int *offsets) {
+bool World::prepare_sand_pull() {
     // A moved grain is stamped out of the sweep. For every remaining grain the
     // spatial coefficients stay valid, even when a prior contact changes its velocity.
     constexpr int cells = block * block * block;
-    const float reach = granular_material(Sand).attraction_range * cast_radius_scale + 2.f * scale;
+    constexpr size_t scratch_budget = 64u * 1024 * 1024;
+    constexpr size_t max_chunks = scratch_budget / (cells * sizeof(SandPull));
+    constexpr size_t minimum_grains = 16384;
+    if (!pulling || grains.size() < minimum_grains) return false;
+
+    const float radius = granular_material(Sand).attraction_range * cast_radius_scale + 2.f * scale;
+    const V3 reach(radius, radius, radius);
+    const I3 lo = grid(field - reach), hi = grid(field + reach);
+    if (hi.x < 0 || hi.y < 0 || hi.z < 0 || lo.x >= nx || lo.y >= ny || lo.z >= nz) return false;
+    const I3 first(std::max(0, lo.x) / block, std::max(0, lo.y) / block, std::max(0, lo.z) / block);
+    const I3 last(std::min(nx - 1, hi.x) / block, std::min(ny - 1, hi.y) / block, std::min(nz - 1, hi.z) / block);
+
     sand_pull_chunks.clear();
-    int grains_in_slab = 0;
-    for (int entry = 0; entry < count; ++entry) {
-        const int population = sand_chunk_counts[chunk_id(chunks[entry])];
-        offsets[entry] = -1;
-        if (population < cells / 8 || chunk_distance_squared(chunks[entry], field) > reach * reach) continue;
-        grains_in_slab += population;
-        sand_pull_chunks.push_back(entry);
-    }
-    if (grains_in_slab < 4096) return;
-    sand_pull_slab.resize(sand_pull_chunks.size() * cells);
+    size_t population = 0;
+    for (int y = first.y; y <= last.y; ++y)
+        for (int z = first.z; z <= last.z; ++z)
+            for (int x = first.x; x <= last.x; ++x) {
+                const I3 chunk(x, y, z);
+                const int count = sand_chunk_counts[chunk_id(chunk)];
+                if (count < cells / 8 || !awake.test(chunk) || chunk_distance_squared(chunk, field) > radius * radius)
+                    continue;
+                if (sand_pull_chunks.size() == max_chunks) return false;
+                sand_pull_chunks.push_back(chunk);
+                population += count;
+            }
+    if (population < minimum_grains) return false;
+
     auto &pool = sand_worker_pool();
+    if (pool.count == 1) return false;
+    sand_pull_offsets.assign(chunk_count, -1);
+    sand_pull_cache.resize(sand_pull_chunks.size() * cells);
     pool.run([&](int worker) {
         for (size_t task = worker; task < sand_pull_chunks.size(); task += pool.count) {
-            const int entry = sand_pull_chunks[task];
-            const I3 start = chunks[entry] * block;
+            const I3 chunk = sand_pull_chunks[task];
+            const I3 start = chunk * block;
             const int offset = int(task) * cells;
-            offsets[entry] = offset;
+            sand_pull_offsets[chunk_id(chunk)] = offset;
             for (int y = 0; y < std::min(block, ny - start.y); ++y) {
                 for (int z = 0; z < block; ++z) {
                     const int base = flat({start.x, start.y + y, start.z + z});
-                    const int row = base / block;
-                    for (unsigned bits = sand_rows[row]; bits; bits &= bits - 1) {
+                    for (unsigned bits = sand_rows[base / block]; bits; bits &= bits - 1) {
                         const int x = next_row_cell(bits, false);
                         const Grain &grain = grains[voxels[base + x].occupant];
-                        sand_pull_slab[offset + (y * block + z) * block + x] =
+                        sand_pull_cache[offset + (y * block + z) * block + x] =
                             free_particle_pull(grain, {start.x + x, start.y + y, start.z + z}, Sand, false);
                     }
                 }
             }
         }
     });
+    return true;
 }
 #endif
 
@@ -516,8 +534,7 @@ void World::step() {
     // The traversal within each row stays bottom-up and alternates X/Z.
     std::array<I3, bx * bz> slab_chunks;
 #if SOMEVOXEL_PARALLEL_SAND_WORKERS > 1
-    std::array<int, bx * bz> field_offsets;
-    const bool prepare_field = pulling && grains.size() >= 16384;
+    const bool field_prepared = prepare_sand_pull();
 #endif
     const bool allow_settled_sand = !winding && airborne_earth_ejecta.empty();
     std::chrono::steady_clock::duration collect_time{};
@@ -540,9 +557,6 @@ void World::step() {
         if (profile_sand_sweep) collect_time += std::chrono::steady_clock::now() - collect_start;
         if (allow_settled_sand)
             for (int entry = 0; entry < count; ++entry) certify_settled_sand(slab_chunks[entry]);
-#if SOMEVOXEL_PARALLEL_SAND_WORKERS > 1
-        if (prepare_field) prepare_sand_pull_slab(slab_chunks.data(), count, field_offsets.data());
-#endif
         active_count += count;
         for (int y = cy * block; y < std::min(ny, (cy + 1) * block); ++y) {
             for (int entry = 0; entry < count; ++entry) {
@@ -559,6 +573,9 @@ void World::step() {
                     if (profile_sand_sweep) sand_sweep.empty_rows += block;
                     continue;
                 }
+#if SOMEVOXEL_PARALLEL_SAND_WORKERS > 1
+                const int field_offset = field_prepared ? sand_pull_offsets[chunk_index] : -1;
+#endif
                 for (int z = 0; z < block; ++z) {
                     const I3 row(chunk.x * block, y, chunk.z * block + (reverse_z ? block - 1 - z : z));
                     const int row_start = flat(row);
@@ -588,9 +605,9 @@ void World::step() {
                     }
                     const SandPull *field_row = nullptr;
 #if SOMEVOXEL_PARALLEL_SAND_WORKERS > 1
-                    if (prepare_field && field_offsets[entry] >= 0) {
+                    if (field_offset >= 0) {
                         const int local_row = (y % block) * block + row.z % block;
-                        field_row = sand_pull_slab.data() + field_offsets[entry] + local_row * block;
+                        field_row = sand_pull_cache.data() + field_offset + local_row * block;
                     }
 #endif
                     while (mask) {

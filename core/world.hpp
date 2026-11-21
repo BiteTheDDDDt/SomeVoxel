@@ -1456,9 +1456,10 @@ private:
 #if SOMEVOXEL_PARALLEL_SAND_WORKERS > 1
     std::unique_ptr<HeadWorkers> sand_workers;
     HeadWorkers &sand_worker_pool();
-    std::vector<SandPull> sand_pull_slab;
-    std::vector<int> sand_pull_chunks;
-    void prepare_sand_pull_slab(const I3 *chunks, int count, int *offsets);
+    std::vector<SandPull> sand_pull_cache;
+    std::vector<I3> sand_pull_chunks;
+    std::vector<int> sand_pull_offsets;
+    bool prepare_sand_pull();
 #endif
 
     template <typename Fits>
